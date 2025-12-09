@@ -1,0 +1,72 @@
+mod services;
+
+use clap::{Parser, Subcommand};
+use ross_core::container_service_server::ContainerServiceServer;
+use ross_core::image_service_server::ImageServiceServer;
+use ross_core::ross_server::RossServer;
+use ross_store::FileSystemStore;
+use services::{ContainerServiceImpl, ImageServiceImpl, RossService};
+use std::path::PathBuf;
+use std::sync::Arc;
+use tonic::transport::Server;
+
+#[derive(Parser)]
+#[command(name = "ross-daemon")]
+#[command(about = "Ross daemon gRPC server")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Start the gRPC server
+    Start {
+        /// Host address to bind to
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
+
+        /// Port to listen on
+        #[arg(long, default_value_t = 50051)]
+        port: u16,
+
+        /// Data directory for storing images
+        #[arg(long, default_value = "/tmp/ross")]
+        data_dir: PathBuf,
+    },
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Start {
+            host,
+            port,
+            data_dir,
+        } => {
+            let addr = format!("{}:{}", host, port).parse()?;
+
+            let store_path = data_dir.join("store");
+            tracing::info!("Initializing store at {:?}", store_path);
+            let store = FileSystemStore::new(&store_path).await?;
+            let store = Arc::new(store);
+
+            tracing::info!("Starting Ross daemon gRPC server on {}", addr);
+
+            Server::builder()
+                .add_service(RossServer::new(RossService))
+                .add_service(ImageServiceServer::new(ImageServiceImpl::new(
+                    store.clone(),
+                )))
+                .add_service(ContainerServiceServer::new(ContainerServiceImpl))
+                .serve(addr)
+                .await?;
+        }
+    }
+
+    Ok(())
+}

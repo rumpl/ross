@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package ross;
+
+service Ross {
+    rpc HealthCheck (HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+    bool healthy = 1;
+    string version = 2;
+}

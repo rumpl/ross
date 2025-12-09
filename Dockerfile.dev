@@ -1,0 +1,30 @@
+# Development Dockerfile for ross
+# Usage:
+#   docker build -f Dockerfile.dev -t ross-dev .
+#   docker run -it --rm -v $(pwd):/app -p 50051:50051 ross-dev
+#
+# For development with cargo watch:
+#   docker run -it --rm -v $(pwd):/app -p 50051:50051 ross-dev watch
+
+FROM rust:alpine
+
+RUN apk add --no-cache \
+    musl-dev \
+    protobuf-dev \
+    protoc
+
+RUN cargo install cargo-watch
+
+WORKDIR /app
+
+ENV CARGO_TARGET_DIR=/app/target-docker
+ENV RUST_BACKTRACE=1
+ENV RUST_LOG=debug
+
+EXPOSE 50051
+
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["daemon"]

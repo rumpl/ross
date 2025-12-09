@@ -1,0 +1,177 @@
+syntax = "proto3";
+
+package ross;
+
+import "google/protobuf/timestamp.proto";
+
+service ImageService {
+    rpc ListImages (ListImagesRequest) returns (ListImagesResponse);
+    rpc InspectImage (InspectImageRequest) returns (InspectImageResponse);
+    rpc PullImage (PullImageRequest) returns (stream PullImageProgress);
+    rpc PushImage (PushImageRequest) returns (stream PushImageProgress);
+    rpc BuildImage (BuildImageRequest) returns (stream BuildImageProgress);
+    rpc RemoveImage (RemoveImageRequest) returns (RemoveImageResponse);
+    rpc TagImage (TagImageRequest) returns (TagImageResponse);
+    rpc SearchImages (SearchImagesRequest) returns (SearchImagesResponse);
+}
+
+message Image {
+    string id = 1;
+    repeated string repo_tags = 2;
+    repeated string repo_digests = 3;
+    string parent = 4;
+    string comment = 5;
+    google.protobuf.Timestamp created = 6;
+    string container = 7;
+    string docker_version = 8;
+    string author = 9;
+    string architecture = 10;
+    string os = 11;
+    int64 size = 12;
+    int64 virtual_size = 13;
+    map<string, string> labels = 14;
+    RootFS root_fs = 15;
+}
+
+message RootFS {
+    string type = 1;
+    repeated string layers = 2;
+}
+
+message ImageHistory {
+    string id = 1;
+    google.protobuf.Timestamp created = 2;
+    string created_by = 3;
+    repeated string tags = 4;
+    int64 size = 5;
+    string comment = 6;
+}
+
+message RegistryAuth {
+    string username = 1;
+    string password = 2;
+    string server_address = 3;
+    string identity_token = 4;
+}
+
+message ProgressDetail {
+    int64 current = 1;
+    int64 total = 2;
+}
+
+message SearchResult {
+    string name = 1;
+    string description = 2;
+    int32 star_count = 3;
+    bool is_official = 4;
+    bool is_automated = 5;
+}
+
+message BuildAux {
+    string id = 1;
+}
+
+// ListImages
+message ListImagesRequest {
+    bool all = 1;
+    map<string, string> filters = 2;
+    bool digests = 3;
+}
+
+message ListImagesResponse {
+    repeated Image images = 1;
+}
+
+// InspectImage
+message InspectImageRequest {
+    string image_id = 1;
+}
+
+message InspectImageResponse {
+    Image image = 1;
+    repeated ImageHistory history = 2;
+}
+
+// PullImage
+message PullImageRequest {
+    string image_name = 1;
+    string tag = 2;
+    RegistryAuth registry_auth = 3;
+}
+
+message PullImageProgress {
+    string status = 1;
+    string progress = 2;
+    ProgressDetail progress_detail = 3;
+    string id = 4;
+    string error = 5;
+}
+
+// PushImage
+message PushImageRequest {
+    string image_name = 1;
+    string tag = 2;
+    RegistryAuth registry_auth = 3;
+}
+
+message PushImageProgress {
+    string status = 1;
+    string progress = 2;
+    ProgressDetail progress_detail = 3;
+    string id = 4;
+    string error = 5;
+}
+
+// BuildImage
+message BuildImageRequest {
+    string dockerfile = 1;
+    string context_path = 2;
+    repeated string tags = 3;
+    map<string, string> build_args = 4;
+    bool no_cache = 5;
+    bool pull = 6;
+    string target = 7;
+    map<string, string> labels = 8;
+    string platform = 9;
+}
+
+message BuildImageProgress {
+    string stream = 1;
+    string error = 2;
+    string progress = 3;
+    BuildAux aux = 4;
+}
+
+// RemoveImage
+message RemoveImageRequest {
+    string image_id = 1;
+    bool force = 2;
+    bool prune_children = 3;
+}
+
+message RemoveImageResponse {
+    repeated string deleted = 1;
+    repeated string untagged = 2;
+}
+
+// TagImage
+message TagImageRequest {
+    string source_image = 1;
+    string repository = 2;
+    string tag = 3;
+}
+
+message TagImageResponse {
+    bool success = 1;
+}
+
+// SearchImages
+message SearchImagesRequest {
+    string term = 1;
+    int32 limit = 2;
+    map<string, string> filters = 3;
+}
+
+message SearchImagesResponse {
+    repeated SearchResult results = 1;
+}

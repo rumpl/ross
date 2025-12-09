@@ -1,0 +1,647 @@
+syntax = "proto3";
+
+package ross;
+
+import "google/protobuf/timestamp.proto";
+
+service ContainerService {
+    rpc CreateContainer (CreateContainerRequest) returns (CreateContainerResponse);
+    rpc StartContainer (StartContainerRequest) returns (StartContainerResponse);
+    rpc StopContainer (StopContainerRequest) returns (StopContainerResponse);
+    rpc RestartContainer (RestartContainerRequest) returns (RestartContainerResponse);
+    rpc ListContainers (ListContainersRequest) returns (ListContainersResponse);
+    rpc InspectContainer (InspectContainerRequest) returns (InspectContainerResponse);
+    rpc RemoveContainer (RemoveContainerRequest) returns (RemoveContainerResponse);
+    rpc PauseContainer (PauseContainerRequest) returns (PauseContainerResponse);
+    rpc UnpauseContainer (UnpauseContainerRequest) returns (UnpauseContainerResponse);
+    rpc GetLogs (GetLogsRequest) returns (stream LogEntry);
+    rpc Exec (ExecRequest) returns (ExecResponse);
+    rpc ExecStart (ExecStartRequest) returns (stream ExecOutput);
+    rpc Attach (stream AttachRequest) returns (stream AttachOutput);
+    rpc Wait (WaitContainerRequest) returns (WaitContainerResponse);
+    rpc Kill (KillContainerRequest) returns (KillContainerResponse);
+    rpc Rename (RenameContainerRequest) returns (RenameContainerResponse);
+    rpc Stats (StatsRequest) returns (stream StatsResponse);
+}
+
+// Core Container Model
+message Container {
+    string id = 1;
+    repeated string names = 2;
+    string image = 3;
+    string image_id = 4;
+    string command = 5;
+    google.protobuf.Timestamp created = 6;
+    string state = 7;
+    string status = 8;
+    repeated PortBinding ports = 9;
+    map<string, string> labels = 10;
+    int64 size_rw = 11;
+    int64 size_root_fs = 12;
+    HostConfigSummary host_config = 13;
+    NetworkSettingsSummary network_settings = 14;
+    repeated MountPoint mounts = 15;
+}
+
+message HostConfigSummary {
+    string network_mode = 1;
+}
+
+message NetworkSettingsSummary {
+    map<string, EndpointConfig> networks = 1;
+}
+
+message MountPoint {
+    string type = 1;
+    string name = 2;
+    string source = 3;
+    string destination = 4;
+    string driver = 5;
+    string mode = 6;
+    bool rw = 7;
+    string propagation = 8;
+}
+
+// Container Configuration
+message ContainerConfig {
+    string hostname = 1;
+    string domainname = 2;
+    string user = 3;
+    bool attach_stdin = 4;
+    bool attach_stdout = 5;
+    bool attach_stderr = 6;
+    repeated string exposed_ports = 7;
+    bool tty = 8;
+    bool open_stdin = 9;
+    bool stdin_once = 10;
+    repeated string env = 11;
+    repeated string cmd = 12;
+    repeated string entrypoint = 13;
+    string image = 14;
+    map<string, string> labels = 15;
+    map<string, VolumeOptions> volumes = 16;
+    string working_dir = 17;
+    bool network_disabled = 18;
+    string mac_address = 19;
+    string stop_signal = 20;
+    int32 stop_timeout = 21;
+    repeated string shell = 22;
+    HealthConfig healthcheck = 23;
+}
+
+message VolumeOptions {
+}
+
+message HealthConfig {
+    repeated string test = 1;
+    int64 interval = 2;
+    int64 timeout = 3;
+    int32 retries = 4;
+    int64 start_period = 5;
+}
+
+// Host Configuration
+message HostConfig {
+    repeated string binds = 1;
+    string container_id_file = 2;
+    LogConfig log_config = 3;
+    string network_mode = 4;
+    repeated PortBinding port_bindings = 5;
+    RestartPolicy restart_policy = 6;
+    bool auto_remove = 7;
+    string volume_driver = 8;
+    repeated string volumes_from = 9;
+    repeated string cap_add = 10;
+    repeated string cap_drop = 11;
+    string cgroup_ns_mode = 12;
+    repeated string dns = 13;
+    repeated string dns_options = 14;
+    repeated string dns_search = 15;
+    repeated string extra_hosts = 16;
+    repeated string group_add = 17;
+    string ipc_mode = 18;
+    string cgroup = 19;
+    repeated string links = 20;
+    int32 oom_score_adj = 21;
+    string pid_mode = 22;
+    bool privileged = 23;
+    bool publish_all_ports = 24;
+    bool readonly_rootfs = 25;
+    repeated string security_opt = 26;
+    map<string, string> storage_opt = 27;
+    map<string, string> tmpfs = 28;
+    string uts_mode = 29;
+    string userns_mode = 30;
+    int64 shm_size = 31;
+    map<string, string> sysctls = 32;
+    string runtime = 33;
+    string isolation = 34;
+    Resources resources = 35;
+    repeated Mount mounts = 36;
+    bool init = 37;
+    string init_path = 38;
+}
+
+message LogConfig {
+    string type = 1;
+    map<string, string> config = 2;
+}
+
+message PortBinding {
+    string host_ip = 1;
+    string host_port = 2;
+    string container_port = 3;
+    string protocol = 4;
+}
+
+message RestartPolicy {
+    string name = 1;
+    int32 maximum_retry_count = 2;
+}
+
+// Resource Limits
+message Resources {
+    int64 cpu_shares = 1;
+    int64 memory = 2;
+    int64 nano_cpus = 3;
+    string cgroup_parent = 4;
+    int32 blkio_weight = 5;
+    repeated WeightDevice blkio_weight_device = 6;
+    repeated ThrottleDevice blkio_device_read_bps = 7;
+    repeated ThrottleDevice blkio_device_write_bps = 8;
+    repeated ThrottleDevice blkio_device_read_iops = 9;
+    repeated ThrottleDevice blkio_device_write_iops = 10;
+    int64 cpu_period = 11;
+    int64 cpu_quota = 12;
+    int64 cpu_realtime_period = 13;
+    int64 cpu_realtime_runtime = 14;
+    string cpuset_cpus = 15;
+    string cpuset_mems = 16;
+    repeated DeviceMapping devices = 17;
+    repeated string device_cgroup_rules = 18;
+    repeated DeviceRequest device_requests = 19;
+    int64 kernel_memory = 20;
+    int64 kernel_memory_tcp = 21;
+    int64 memory_reservation = 22;
+    int64 memory_swap = 23;
+    int64 memory_swappiness = 24;
+    bool oom_kill_disable = 25;
+    int64 pids_limit = 26;
+    repeated Ulimit ulimits = 27;
+}
+
+message WeightDevice {
+    string path = 1;
+    int32 weight = 2;
+}
+
+message ThrottleDevice {
+    string path = 1;
+    uint64 rate = 2;
+}
+
+message DeviceMapping {
+    string path_on_host = 1;
+    string path_in_container = 2;
+    string cgroup_permissions = 3;
+}
+
+message DeviceRequest {
+    string driver = 1;
+    int64 count = 2;
+    repeated string device_ids = 3;
+    repeated string capabilities = 4;
+    map<string, string> options = 5;
+}
+
+message Ulimit {
+    string name = 1;
+    int64 soft = 2;
+    int64 hard = 3;
+}
+
+// Network Configuration
+message NetworkingConfig {
+    map<string, EndpointConfig> endpoints_config = 1;
+}
+
+message EndpointConfig {
+    EndpointIPAMConfig ipam_config = 1;
+    repeated string links = 2;
+    repeated string aliases = 3;
+    string network_id = 4;
+    string endpoint_id = 5;
+    string gateway = 6;
+    string ip_address = 7;
+    int32 ip_prefix_len = 8;
+    string ipv6_gateway = 9;
+    string global_ipv6_address = 10;
+    int32 global_ipv6_prefix_len = 11;
+    string mac_address = 12;
+    map<string, string> driver_opts = 13;
+}
+
+message EndpointIPAMConfig {
+    string ipv4_address = 1;
+    string ipv6_address = 2;
+    repeated string link_local_ips = 3;
+}
+
+// Mount Configuration
+enum MountType {
+    MOUNT_TYPE_UNSPECIFIED = 0;
+    MOUNT_TYPE_BIND = 1;
+    MOUNT_TYPE_VOLUME = 2;
+    MOUNT_TYPE_TMPFS = 3;
+    MOUNT_TYPE_NPIPE = 4;
+    MOUNT_TYPE_CLUSTER = 5;
+}
+
+message Mount {
+    MountType type = 1;
+    string source = 2;
+    string target = 3;
+    bool read_only = 4;
+    string consistency = 5;
+    BindOptions bind_options = 6;
+    VolumeDriverOptions volume_options = 7;
+    TmpfsOptions tmpfs_options = 8;
+}
+
+message BindOptions {
+    string propagation = 1;
+    bool non_recursive = 2;
+}
+
+message VolumeDriverOptions {
+    string name = 1;
+    map<string, string> driver_config = 2;
+    map<string, string> labels = 3;
+    bool no_copy = 4;
+}
+
+message TmpfsOptions {
+    int64 size_bytes = 1;
+    int32 mode = 2;
+}
+
+// Container State
+message ContainerState {
+    string status = 1;
+    bool running = 2;
+    bool paused = 3;
+    bool restarting = 4;
+    bool oom_killed = 5;
+    bool dead = 6;
+    int32 pid = 7;
+    int32 exit_code = 8;
+    string error = 9;
+    google.protobuf.Timestamp started_at = 10;
+    google.protobuf.Timestamp finished_at = 11;
+    Health health = 12;
+}
+
+message Health {
+    string status = 1;
+    int32 failing_streak = 2;
+    repeated HealthLog log = 3;
+}
+
+message HealthLog {
+    google.protobuf.Timestamp start = 1;
+    google.protobuf.Timestamp end = 2;
+    int32 exit_code = 3;
+    string output = 4;
+}
+
+// Logs & Exec Messages
+message LogEntry {
+    google.protobuf.Timestamp timestamp = 1;
+    string stream = 2;
+    string message = 3;
+}
+
+message ExecConfig {
+    bool attach_stdin = 1;
+    bool attach_stdout = 2;
+    bool attach_stderr = 3;
+    string detach_keys = 4;
+    bool tty = 5;
+    repeated string env = 6;
+    repeated string cmd = 7;
+    bool privileged = 8;
+    string user = 9;
+    string working_dir = 10;
+}
+
+message ExecOutput {
+    string stream = 1;
+    bytes data = 2;
+}
+
+// Stats Messages
+message StatsResponse {
+    google.protobuf.Timestamp read = 1;
+    google.protobuf.Timestamp preread = 2;
+    PidsStats pids_stats = 3;
+    BlkioStats blkio_stats = 4;
+    uint32 num_procs = 5;
+    StorageStats storage_stats = 6;
+    CPUStats cpu_stats = 7;
+    CPUStats precpu_stats = 8;
+    MemoryStats memory_stats = 9;
+    map<string, NetworkStats> networks = 10;
+}
+
+message PidsStats {
+    uint64 current = 1;
+    uint64 limit = 2;
+}
+
+message BlkioStats {
+    repeated BlkioStatEntry io_service_bytes_recursive = 1;
+    repeated BlkioStatEntry io_serviced_recursive = 2;
+    repeated BlkioStatEntry io_queue_recursive = 3;
+    repeated BlkioStatEntry io_service_time_recursive = 4;
+    repeated BlkioStatEntry io_wait_time_recursive = 5;
+    repeated BlkioStatEntry io_merged_recursive = 6;
+    repeated BlkioStatEntry io_time_recursive = 7;
+    repeated BlkioStatEntry sectors_recursive = 8;
+}
+
+message BlkioStatEntry {
+    uint64 major = 1;
+    uint64 minor = 2;
+    string op = 3;
+    uint64 value = 4;
+}
+
+message StorageStats {
+    uint64 read_count_normalized = 1;
+    uint64 read_size_bytes = 2;
+    uint64 write_count_normalized = 3;
+    uint64 write_size_bytes = 4;
+}
+
+message CPUStats {
+    CPUUsage cpu_usage = 1;
+    uint64 system_cpu_usage = 2;
+    uint64 online_cpus = 3;
+    ThrottlingData throttling_data = 4;
+}
+
+message CPUUsage {
+    uint64 total_usage = 1;
+    repeated uint64 percpu_usage = 2;
+    uint64 usage_in_kernelmode = 3;
+    uint64 usage_in_usermode = 4;
+}
+
+message ThrottlingData {
+    uint64 periods = 1;
+    uint64 throttled_periods = 2;
+    uint64 throttled_time = 3;
+}
+
+message MemoryStats {
+    uint64 usage = 1;
+    uint64 max_usage = 2;
+    map<string, uint64> stats = 3;
+    uint64 failcnt = 4;
+    uint64 limit = 5;
+    uint64 commit = 6;
+    uint64 commit_peak = 7;
+    uint64 private_working_set = 8;
+}
+
+message NetworkStats {
+    uint64 rx_bytes = 1;
+    uint64 rx_packets = 2;
+    uint64 rx_errors = 3;
+    uint64 rx_dropped = 4;
+    uint64 tx_bytes = 5;
+    uint64 tx_packets = 6;
+    uint64 tx_errors = 7;
+    uint64 tx_dropped = 8;
+}
+
+// Request/Response Messages
+
+// CreateContainer
+message CreateContainerRequest {
+    string name = 1;
+    ContainerConfig config = 2;
+    HostConfig host_config = 3;
+    NetworkingConfig networking_config = 4;
+}
+
+message CreateContainerResponse {
+    string id = 1;
+    repeated string warnings = 2;
+}
+
+// StartContainer
+message StartContainerRequest {
+    string container_id = 1;
+    string detach_keys = 2;
+}
+
+message StartContainerResponse {
+}
+
+// StopContainer
+message StopContainerRequest {
+    string container_id = 1;
+    int32 timeout = 2;
+}
+
+message StopContainerResponse {
+}
+
+// RestartContainer
+message RestartContainerRequest {
+    string container_id = 1;
+    int32 timeout = 2;
+}
+
+message RestartContainerResponse {
+}
+
+// ListContainers
+message ListContainersRequest {
+    bool all = 1;
+    int32 limit = 2;
+    bool size = 3;
+    map<string, string> filters = 4;
+}
+
+message ListContainersResponse {
+    repeated Container containers = 1;
+}
+
+// InspectContainer
+message InspectContainerRequest {
+    string container_id = 1;
+    bool size = 2;
+}
+
+message InspectContainerResponse {
+    Container container = 1;
+    ContainerState state = 2;
+    string path = 3;
+    repeated string args = 4;
+    string resolv_conf_path = 5;
+    string hostname_path = 6;
+    string hosts_path = 7;
+    string log_path = 8;
+    string name = 9;
+    int64 restart_count = 10;
+    string driver = 11;
+    string platform = 12;
+    string mount_label = 13;
+    string process_label = 14;
+    string app_armor_profile = 15;
+    repeated string exec_ids = 16;
+    ContainerConfig config = 17;
+    HostConfig host_config = 18;
+    GraphDriverData graph_driver = 19;
+    NetworkSettings network_settings = 20;
+}
+
+message GraphDriverData {
+    string name = 1;
+    map<string, string> data = 2;
+}
+
+message NetworkSettings {
+    string bridge = 1;
+    string sandbox_id = 2;
+    bool hairpin_mode = 3;
+    string link_local_ipv6_address = 4;
+    int32 link_local_ipv6_prefix_len = 5;
+    string sandbox_key = 6;
+    repeated string secondary_ip_addresses = 7;
+    repeated string secondary_ipv6_addresses = 8;
+    string endpoint_id = 9;
+    string gateway = 10;
+    string global_ipv6_address = 11;
+    int32 global_ipv6_prefix_len = 12;
+    string ip_address = 13;
+    int32 ip_prefix_len = 14;
+    string ipv6_gateway = 15;
+    string mac_address = 16;
+    map<string, EndpointConfig> networks = 17;
+}
+
+// RemoveContainer
+message RemoveContainerRequest {
+    string container_id = 1;
+    bool remove_volumes = 2;
+    bool force = 3;
+    bool link = 4;
+}
+
+message RemoveContainerResponse {
+}
+
+// PauseContainer
+message PauseContainerRequest {
+    string container_id = 1;
+}
+
+message PauseContainerResponse {
+}
+
+// UnpauseContainer
+message UnpauseContainerRequest {
+    string container_id = 1;
+}
+
+message UnpauseContainerResponse {
+}
+
+// GetLogs
+message GetLogsRequest {
+    string container_id = 1;
+    bool follow = 2;
+    bool stdout = 3;
+    bool stderr = 4;
+    google.protobuf.Timestamp since = 5;
+    google.protobuf.Timestamp until = 6;
+    bool timestamps = 7;
+    string tail = 8;
+}
+
+// Exec
+message ExecRequest {
+    string container_id = 1;
+    ExecConfig config = 2;
+}
+
+message ExecResponse {
+    string exec_id = 1;
+}
+
+// ExecStart
+message ExecStartRequest {
+    string exec_id = 1;
+    bool detach = 2;
+    bool tty = 3;
+}
+
+// Attach
+message AttachRequest {
+    string container_id = 1;
+    bool stream = 2;
+    bool stdin = 3;
+    bool stdout = 4;
+    bool stderr = 5;
+    string detach_keys = 6;
+    bool logs = 7;
+    bytes input = 8;
+}
+
+message AttachOutput {
+    string stream = 1;
+    bytes data = 2;
+}
+
+// Wait
+message WaitContainerRequest {
+    string container_id = 1;
+    string condition = 2;
+}
+
+message WaitContainerResponse {
+    int64 status_code = 1;
+    WaitError error = 2;
+}
+
+message WaitError {
+    string message = 1;
+}
+
+// Kill
+message KillContainerRequest {
+    string container_id = 1;
+    string signal = 2;
+}
+
+message KillContainerResponse {
+}
+
+// Rename
+message RenameContainerRequest {
+    string container_id = 1;
+    string new_name = 2;
+}
+
+message RenameContainerResponse {
+}
+
+// Stats
+message StatsRequest {
+    string container_id = 1;
+    bool stream = 2;
+    bool one_shot = 3;
+}

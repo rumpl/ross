@@ -1,0 +1,15 @@
+target/
+target-docker/
+.git/
+.gitignore
+*.md
+!README.md
+Dockerfile
+.dockerignore
+.github/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+agent.yaml

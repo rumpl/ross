@@ -1,0 +1,285 @@
+syntax = "proto3";
+
+package ross.store;
+
+import "google/protobuf/timestamp.proto";
+
+service StoreService {
+    // Blob operations
+    rpc GetBlob (GetBlobRequest) returns (stream BlobChunk);
+    rpc PutBlob (stream PutBlobRequest) returns (PutBlobResponse);
+    rpc StatBlob (StatBlobRequest) returns (StatBlobResponse);
+    rpc DeleteBlob (DeleteBlobRequest) returns (DeleteBlobResponse);
+    rpc ListBlobs (ListBlobsRequest) returns (ListBlobsResponse);
+
+    // Manifest operations
+    rpc GetManifest (GetManifestRequest) returns (GetManifestResponse);
+    rpc PutManifest (PutManifestRequest) returns (PutManifestResponse);
+    rpc DeleteManifest (DeleteManifestRequest) returns (DeleteManifestResponse);
+    rpc ListManifests (ListManifestsRequest) returns (ListManifestsResponse);
+
+    // Image index/reference operations
+    rpc GetImageIndex (GetImageIndexRequest) returns (GetImageIndexResponse);
+    rpc PutImageIndex (PutImageIndexRequest) returns (PutImageIndexResponse);
+    rpc DeleteImageIndex (DeleteImageIndexRequest) returns (DeleteImageIndexResponse);
+
+    // Tag operations
+    rpc ResolveTag (ResolveTagRequest) returns (ResolveTagResponse);
+    rpc SetTag (SetTagRequest) returns (SetTagResponse);
+    rpc DeleteTag (DeleteTagRequest) returns (DeleteTagResponse);
+    rpc ListTags (ListTagsRequest) returns (ListTagsResponse);
+
+    // Garbage collection
+    rpc GarbageCollect (GarbageCollectRequest) returns (GarbageCollectResponse);
+
+    // Store info
+    rpc GetStoreInfo (GetStoreInfoRequest) returns (GetStoreInfoResponse);
+}
+
+// Common types
+
+message Digest {
+    string algorithm = 1;  // e.g., "sha256"
+    string hash = 2;       // hex-encoded hash
+}
+
+message BlobInfo {
+    Digest digest = 1;
+    int64 size = 2;
+    string media_type = 3;
+    google.protobuf.Timestamp created_at = 4;
+    google.protobuf.Timestamp accessed_at = 5;
+}
+
+message ManifestInfo {
+    Digest digest = 1;
+    int64 size = 2;
+    string media_type = 3;
+    google.protobuf.Timestamp created_at = 4;
+    string schema_version = 5;
+}
+
+message Platform {
+    string architecture = 1;
+    string os = 2;
+    string os_version = 3;
+    repeated string os_features = 4;
+    string variant = 5;
+}
+
+// Blob operations
+
+message GetBlobRequest {
+    Digest digest = 1;
+    int64 offset = 2;
+    int64 length = 3;  // 0 means read to end
+}
+
+message BlobChunk {
+    bytes data = 1;
+    int64 offset = 2;
+}
+
+message PutBlobRequest {
+    oneof content {
+        PutBlobInit init = 1;
+        bytes data = 2;
+    }
+}
+
+message PutBlobInit {
+    string media_type = 1;
+    int64 expected_size = 2;
+    Digest expected_digest = 3;  // optional, for verification
+}
+
+message PutBlobResponse {
+    Digest digest = 1;
+    int64 size = 2;
+}
+
+message StatBlobRequest {
+    Digest digest = 1;
+}
+
+message StatBlobResponse {
+    bool exists = 1;
+    BlobInfo info = 2;
+}
+
+message DeleteBlobRequest {
+    Digest digest = 1;
+}
+
+message DeleteBlobResponse {
+    bool deleted = 1;
+}
+
+message ListBlobsRequest {
+    string media_type_filter = 1;
+    int32 limit = 2;
+    string continuation_token = 3;
+}
+
+message ListBlobsResponse {
+    repeated BlobInfo blobs = 1;
+    string continuation_token = 2;
+}
+
+// Manifest operations
+
+message GetManifestRequest {
+    Digest digest = 1;
+}
+
+message GetManifestResponse {
+    bytes content = 1;
+    string media_type = 2;
+    Digest digest = 3;
+}
+
+message PutManifestRequest {
+    bytes content = 1;
+    string media_type = 2;
+}
+
+message PutManifestResponse {
+    Digest digest = 1;
+    int64 size = 2;
+}
+
+message DeleteManifestRequest {
+    Digest digest = 1;
+}
+
+message DeleteManifestResponse {
+    bool deleted = 1;
+}
+
+message ListManifestsRequest {
+    string media_type_filter = 1;
+    int32 limit = 2;
+    string continuation_token = 3;
+}
+
+message ListManifestsResponse {
+    repeated ManifestInfo manifests = 1;
+    string continuation_token = 2;
+}
+
+// Image index operations (for multi-platform images)
+
+message ImageIndexEntry {
+    Digest manifest_digest = 1;
+    string media_type = 2;
+    int64 size = 3;
+    Platform platform = 4;
+    map<string, string> annotations = 5;
+}
+
+message ImageIndex {
+    int32 schema_version = 1;
+    string media_type = 2;
+    repeated ImageIndexEntry manifests = 3;
+    map<string, string> annotations = 4;
+}
+
+message GetImageIndexRequest {
+    Digest digest = 1;
+}
+
+message GetImageIndexResponse {
+    ImageIndex index = 1;
+    Digest digest = 2;
+}
+
+message PutImageIndexRequest {
+    ImageIndex index = 1;
+}
+
+message PutImageIndexResponse {
+    Digest digest = 1;
+    int64 size = 2;
+}
+
+message DeleteImageIndexRequest {
+    Digest digest = 1;
+}
+
+message DeleteImageIndexResponse {
+    bool deleted = 1;
+}
+
+// Tag operations
+
+message ResolveTagRequest {
+    string repository = 1;
+    string tag = 2;
+}
+
+message ResolveTagResponse {
+    Digest digest = 1;
+    string media_type = 2;
+}
+
+message SetTagRequest {
+    string repository = 1;
+    string tag = 2;
+    Digest digest = 3;
+}
+
+message SetTagResponse {
+    Digest previous_digest = 1;  // if tag was already set
+}
+
+message DeleteTagRequest {
+    string repository = 1;
+    string tag = 2;
+}
+
+message DeleteTagResponse {
+    bool deleted = 1;
+}
+
+message ListTagsRequest {
+    string repository = 1;
+    int32 limit = 2;
+    string continuation_token = 3;
+}
+
+message TagInfo {
+    string tag = 1;
+    Digest digest = 2;
+    google.protobuf.Timestamp updated_at = 3;
+}
+
+message ListTagsResponse {
+    repeated TagInfo tags = 1;
+    string continuation_token = 2;
+}
+
+// Garbage collection
+
+message GarbageCollectRequest {
+    bool dry_run = 1;
+    bool delete_untagged = 2;
+}
+
+message GarbageCollectResponse {
+    int64 blobs_removed = 1;
+    int64 manifests_removed = 2;
+    int64 bytes_freed = 3;
+    repeated Digest removed_digests = 4;
+}
+
+// Store info
+
+message GetStoreInfoRequest {}
+
+message GetStoreInfoResponse {
+    string store_path = 1;
+    int64 total_size = 2;
+    int64 blob_count = 3;
+    int64 manifest_count = 4;
+    int64 tag_count = 5;
+}
