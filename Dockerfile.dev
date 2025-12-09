@@ -11,6 +11,9 @@ FROM rust:alpine
 RUN apk add --no-cache \
     musl-dev \
     protobuf-dev \
+    openssl-dev \
+    openssl-libs-static \
+    pkgconf \
     protoc
 
 RUN cargo install cargo-watch
