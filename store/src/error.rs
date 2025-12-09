@@ -27,13 +27,15 @@ pub enum StoreError {
 impl From<StoreError> for tonic::Status {
     fn from(err: StoreError) -> Self {
         match err {
-            StoreError::BlobNotFound(_) | StoreError::ManifestNotFound(_) | StoreError::TagNotFound(_, _) => {
-                tonic::Status::not_found(err.to_string())
-            }
+            StoreError::BlobNotFound(_)
+            | StoreError::ManifestNotFound(_)
+            | StoreError::TagNotFound(_, _) => tonic::Status::not_found(err.to_string()),
             StoreError::DigestMismatch { .. } | StoreError::InvalidDigest(_) => {
                 tonic::Status::invalid_argument(err.to_string())
             }
-            StoreError::Io(_) | StoreError::Serialization(_) => tonic::Status::internal(err.to_string()),
+            StoreError::Io(_) | StoreError::Serialization(_) => {
+                tonic::Status::internal(err.to_string())
+            }
         }
     }
 }

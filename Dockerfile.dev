@@ -1,12 +1,13 @@
 # Development Dockerfile for ross
 # Usage:
 #   docker build -f Dockerfile.dev -t ross-dev .
-#   docker run -it --rm -v $(pwd):/app -p 50051:50051 ross-dev
+#   docker run -it --rm --privileged -v /tmp/ross-data:/tmp/ross -p 50051:50051 ross-dev daemon
 #
-# For development with cargo watch:
-#   docker run -it --rm -v $(pwd):/app -p 50051:50051 ross-dev watch
+# For CLI:
+#   docker run --rm --network host ross-dev cli health
+#   docker run --rm --network host ross-dev cli run hello-world
 
-FROM rust:alpine
+FROM rust:alpine AS builder
 
 RUN apk add --no-cache \
     musl-dev \
@@ -16,13 +17,45 @@ RUN apk add --no-cache \
     pkgconf \
     protoc
 
-RUN cargo install cargo-watch
+WORKDIR /build
 
-WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY cli/Cargo.toml cli/Cargo.toml
+COPY container/Cargo.toml container/Cargo.toml
+COPY core/Cargo.toml core/Cargo.toml
+COPY daemon/Cargo.toml daemon/Cargo.toml
+COPY image/Cargo.toml image/Cargo.toml
+COPY remote/Cargo.toml remote/Cargo.toml
+COPY shim/Cargo.toml shim/Cargo.toml
+COPY snapshotter/Cargo.toml snapshotter/Cargo.toml
+COPY store/Cargo.toml store/Cargo.toml
 
-ENV CARGO_TARGET_DIR=/app/target-docker
-ENV RUST_BACKTRACE=1
-ENV RUST_LOG=debug
+RUN mkdir -p cli/src container/src core/src daemon/src image/src remote/src shim/src snapshotter/src store/src && \
+    echo "fn main() {}" > cli/src/main.rs && \
+    echo "fn main() {}" > daemon/src/main.rs && \
+    touch container/src/lib.rs core/src/lib.rs image/src/lib.rs remote/src/lib.rs shim/src/lib.rs snapshotter/src/lib.rs store/src/lib.rs
+
+COPY proto proto
+
+RUN cargo build --release 2>/dev/null || true
+
+COPY . .
+
+RUN touch cli/src/main.rs daemon/src/main.rs container/src/lib.rs core/src/lib.rs image/src/lib.rs remote/src/lib.rs shim/src/lib.rs snapshotter/src/lib.rs store/src/lib.rs
+
+RUN cargo build --release
+
+FROM alpine:latest
+
+RUN apk add --no-cache \
+    runc \
+    fuse-overlayfs \
+    ca-certificates
+
+COPY --from=builder /build/target/release/ross-daemon /usr/local/bin/
+COPY --from=builder /build/target/release/ross-cli /usr/local/bin/
+
+ENV RUST_LOG=info,ross=debug
 
 EXPOSE 50051
 

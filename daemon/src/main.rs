@@ -5,12 +5,15 @@ use ross_container::ContainerService;
 use ross_core::container_service_server::ContainerServiceServer;
 use ross_core::image_service_server::ImageServiceServer;
 use ross_core::ross_server::RossServer;
+use ross_core::snapshotter_service_server::SnapshotterServiceServer;
 use ross_image::ImageService;
+use ross_snapshotter::OverlaySnapshotter;
 use ross_store::FileSystemStore;
-use services::{ContainerServiceGrpc, ImageServiceGrpc, RossService};
+use services::{ContainerServiceGrpc, ImageServiceGrpc, RossService, SnapshotterServiceGrpc};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tonic::transport::Server;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
 #[command(name = "ross-daemon")]
@@ -44,7 +47,11 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,ross=debug")),
+        )
+        .init();
 
     let cli = Cli::parse();
 
@@ -62,8 +69,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let store = FileSystemStore::new(&store_path).await?;
             let store = Arc::new(store);
 
-            let container_service = Arc::new(ContainerService::new());
-            let image_service = Arc::new(ImageService::new(store.clone(), max_concurrent_downloads));
+            let snapshotter_path = data_dir.join("snapshotter");
+            tracing::info!("Initializing snapshotter at {:?}", snapshotter_path);
+            let snapshotter = OverlaySnapshotter::new(&snapshotter_path, store.clone()).await?;
+            let snapshotter = Arc::new(snapshotter);
+
+            tracing::info!("Initializing container service");
+            let container_service =
+                ContainerService::new(&data_dir, snapshotter.clone(), store.clone()).await?;
+            let container_service = Arc::new(container_service);
+
+            let image_service = Arc::new(ImageService::new(
+                store.clone(),
+                snapshotter.clone(),
+                max_concurrent_downloads,
+            ));
 
             tracing::info!(
                 "Starting Ross daemon gRPC server on {} (max concurrent downloads: {})",
@@ -73,9 +93,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             Server::builder()
                 .add_service(RossServer::new(RossService))
-                .add_service(ImageServiceServer::new(ImageServiceGrpc::new(image_service)))
+                .add_service(ImageServiceServer::new(ImageServiceGrpc::new(
+                    image_service,
+                )))
                 .add_service(ContainerServiceServer::new(ContainerServiceGrpc::new(
                     container_service,
+                )))
+                .add_service(SnapshotterServiceServer::new(SnapshotterServiceGrpc::new(
+                    snapshotter,
                 )))
                 .serve(addr)
                 .await?;

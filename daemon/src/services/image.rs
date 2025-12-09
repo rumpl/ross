@@ -62,7 +62,11 @@ impl GrpcImageService for ImageServiceGrpc {
 
         Ok(Response::new(InspectImageResponse {
             image: Some(image_to_grpc(inspection.image)),
-            history: inspection.history.into_iter().map(history_to_grpc).collect(),
+            history: inspection
+                .history
+                .into_iter()
+                .map(history_to_grpc)
+                .collect(),
         }))
     }
 

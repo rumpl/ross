@@ -2,23 +2,31 @@ use crate::error::ImageError;
 use crate::types::*;
 use async_stream::stream;
 use ross_remote::{Descriptor, ImageReference, RegistryClient};
+use ross_snapshotter::OverlaySnapshotter;
 use ross_store::FileSystemStore;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{Semaphore, mpsc};
 use tokio_stream::Stream;
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
 
 pub struct ImageService {
     store: Arc<FileSystemStore>,
+    snapshotter: Arc<OverlaySnapshotter>,
     max_concurrent_downloads: usize,
 }
 
 impl ImageService {
-    pub fn new(store: Arc<FileSystemStore>, max_concurrent_downloads: usize) -> Self {
+    pub fn new(
+        store: Arc<FileSystemStore>,
+        snapshotter: Arc<OverlaySnapshotter>,
+        max_concurrent_downloads: usize,
+    ) -> Self {
         Self {
             store,
+            snapshotter,
             max_concurrent_downloads,
         }
     }
@@ -41,15 +49,19 @@ impl ImageService {
                     Err(_) => continue,
                 };
 
-                let manifest: ross_remote::ManifestV2 = match serde_json::from_slice(&manifest_bytes)
-                {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
+                let manifest: ross_remote::ManifestV2 =
+                    match serde_json::from_slice(&manifest_bytes) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
 
                 let config_digest = ross_store::Digest {
                     algorithm: "sha256".to_string(),
-                    hash: manifest.config.digest.trim_start_matches("sha256:").to_string(),
+                    hash: manifest
+                        .config
+                        .digest
+                        .trim_start_matches("sha256:")
+                        .to_string(),
                 };
 
                 let config_bytes = match self.store.get_blob(&config_digest, 0, -1).await {
@@ -73,11 +85,8 @@ impl ImageService {
                     .map(|c| c.labels.clone())
                     .unwrap_or_default();
 
-                let layer_digests: Vec<String> = manifest
-                    .layers
-                    .iter()
-                    .map(|l| l.digest.clone())
-                    .collect();
+                let layer_digests: Vec<String> =
+                    manifest.layers.iter().map(|l| l.digest.clone()).collect();
 
                 images.push(Image {
                     id: format!("sha256:{}", digest.hash),
@@ -133,6 +142,7 @@ impl ImageService {
         tracing::info!("Pulling image: {}", reference.full_name());
 
         let store = self.store.clone();
+        let snapshotter = self.snapshotter.clone();
         let max_concurrent = self.max_concurrent_downloads;
 
         let output = stream! {
@@ -362,6 +372,84 @@ impl ImageService {
                 return;
             }
 
+            yield PullProgress {
+                id: reference.full_name(),
+                status: "Extracting layers".to_string(),
+                progress: String::new(),
+                current: None,
+                total: None,
+                error: None,
+            };
+
+            let mut parent_key: Option<String> = None;
+            for (i, layer) in manifest.layers.iter().enumerate() {
+                let layer_digest = &layer.digest;
+                let short_id = if layer_digest.len() > 19 {
+                    &layer_digest[7..19]
+                } else {
+                    layer_digest
+                };
+
+                let snapshot_key = layer_digest.clone();
+
+                if snapshotter.stat(&snapshot_key).await.is_ok() {
+                    yield PullProgress {
+                        id: short_id.to_string(),
+                        status: "Layer already extracted".to_string(),
+                        progress: String::new(),
+                        current: None,
+                        total: None,
+                        error: None,
+                    };
+                    parent_key = Some(snapshot_key);
+                    continue;
+                }
+
+                yield PullProgress {
+                    id: short_id.to_string(),
+                    status: format!("Extracting layer {}/{}", i + 1, manifest.layers.len()),
+                    progress: String::new(),
+                    current: None,
+                    total: None,
+                    error: None,
+                };
+
+                let mut labels = HashMap::new();
+                labels.insert("containerd.io/snapshot/layer.digest".to_string(), layer_digest.clone());
+
+                match snapshotter.extract_layer(
+                    layer_digest,
+                    parent_key.as_deref(),
+                    &snapshot_key,
+                    labels,
+                ).await {
+                    Ok((key, size)) => {
+                        yield PullProgress {
+                            id: short_id.to_string(),
+                            status: format!("Extracted ({} bytes)", size),
+                            progress: String::new(),
+                            current: None,
+                            total: None,
+                            error: None,
+                        };
+                        parent_key = Some(key);
+                    }
+                    Err(e) => {
+                        yield PullProgress {
+                            id: short_id.to_string(),
+                            status: String::new(),
+                            progress: String::new(),
+                            current: None,
+                            total: None,
+                            error: Some(format!("Failed to extract layer: {}", e)),
+                        };
+                        return;
+                    }
+                }
+            }
+
+            let _ = parent_key; // Top layer is tracked in manifest, no need for separate snapshot
+
             let digest_str = format!("sha256:{}", stored_digest.hash);
             yield PullProgress {
                 id: reference.full_name(),
@@ -456,12 +544,7 @@ impl ImageService {
         repository: &str,
         tag: &str,
     ) -> Result<(), ImageError> {
-        tracing::info!(
-            "Tagging image {} as {}:{}",
-            source_image,
-            repository,
-            tag
-        );
+        tracing::info!("Tagging image {} as {}:{}", source_image, repository, tag);
         Ok(())
     }
 
@@ -473,11 +556,24 @@ impl ImageService {
 
 #[derive(Debug)]
 enum LayerEvent {
-    Downloading { id: String, index: usize, total: usize },
-    Downloaded { id: String },
-    Stored { id: String },
-    Exists { id: String },
-    Error { id: String, error: String },
+    Downloading {
+        id: String,
+        index: usize,
+        total: usize,
+    },
+    Downloaded {
+        id: String,
+    },
+    Stored {
+        id: String,
+    },
+    Exists {
+        id: String,
+    },
+    Error {
+        id: String,
+        error: String,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]

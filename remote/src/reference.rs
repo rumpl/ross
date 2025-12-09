@@ -24,10 +24,7 @@ impl ImageReference {
             if let Some(idx) = reference.rfind(':') {
                 let potential_tag = &reference[idx + 1..];
                 if !potential_tag.contains('/') {
-                    (
-                        &reference[..idx],
-                        Some(potential_tag.to_string()),
-                    )
+                    (&reference[..idx], Some(potential_tag.to_string()))
                 } else {
                     (reference, None)
                 }

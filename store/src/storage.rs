@@ -620,7 +620,12 @@ impl FileSystemStore {
             }
         }
 
-        Ok((blobs_removed, manifests_removed, bytes_freed, removed_digests))
+        Ok((
+            blobs_removed,
+            manifests_removed,
+            bytes_freed,
+            removed_digests,
+        ))
     }
 
     pub async fn list_repositories(&self) -> Result<Vec<String>, StoreError> {
@@ -664,8 +669,8 @@ impl FileSystemStore {
         let blobs = self.list_blobs(None).await?;
         let manifests = self.list_manifests(None).await?;
 
-        let total_size: i64 =
-            blobs.iter().map(|b| b.size).sum::<i64>() + manifests.iter().map(|m| m.size).sum::<i64>();
+        let total_size: i64 = blobs.iter().map(|b| b.size).sum::<i64>()
+            + manifests.iter().map(|m| m.size).sum::<i64>();
 
         let mut tag_count = 0i64;
         let tags_dir = self.root.join(TAGS_DIR);
@@ -681,7 +686,12 @@ impl FileSystemStore {
             }
         }
 
-        Ok((total_size, blobs.len() as i64, manifests.len() as i64, tag_count))
+        Ok((
+            total_size,
+            blobs.len() as i64,
+            manifests.len() as i64,
+            tag_count,
+        ))
     }
 }
 

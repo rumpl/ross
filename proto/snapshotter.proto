@@ -1,0 +1,126 @@
+syntax = "proto3";
+
+package ross;
+
+import "google/protobuf/timestamp.proto";
+
+service SnapshotterService {
+    rpc Prepare (PrepareSnapshotRequest) returns (PrepareSnapshotResponse);
+    rpc View (ViewSnapshotRequest) returns (ViewSnapshotResponse);
+    rpc Mounts (SnapshotMountsRequest) returns (SnapshotMountsResponse);
+    rpc Commit (CommitSnapshotRequest) returns (CommitSnapshotResponse);
+    rpc Remove (RemoveSnapshotRequest) returns (RemoveSnapshotResponse);
+    rpc Stat (StatSnapshotRequest) returns (StatSnapshotResponse);
+    rpc List (ListSnapshotsRequest) returns (ListSnapshotsResponse);
+    rpc Usage (SnapshotUsageRequest) returns (SnapshotUsageResponse);
+    rpc Cleanup (CleanupSnapshotsRequest) returns (CleanupSnapshotsResponse);
+    rpc ExtractLayer (ExtractLayerRequest) returns (ExtractLayerResponse);
+}
+
+message SnapshotMount {
+    string type = 1;
+    string source = 2;
+    string target = 3;
+    repeated string options = 4;
+}
+
+enum SnapshotKind {
+    SNAPSHOT_KIND_UNKNOWN = 0;
+    SNAPSHOT_KIND_VIEW = 1;
+    SNAPSHOT_KIND_ACTIVE = 2;
+    SNAPSHOT_KIND_COMMITTED = 3;
+}
+
+message SnapshotInfo {
+    string key = 1;
+    string parent = 2;
+    SnapshotKind kind = 3;
+    google.protobuf.Timestamp created_at = 4;
+    google.protobuf.Timestamp updated_at = 5;
+    map<string, string> labels = 6;
+}
+
+message PrepareSnapshotRequest {
+    string key = 1;
+    string parent = 2;
+    map<string, string> labels = 3;
+}
+
+message PrepareSnapshotResponse {
+    repeated SnapshotMount mounts = 1;
+}
+
+message ViewSnapshotRequest {
+    string key = 1;
+    string parent = 2;
+    map<string, string> labels = 3;
+}
+
+message ViewSnapshotResponse {
+    repeated SnapshotMount mounts = 1;
+}
+
+message SnapshotMountsRequest {
+    string key = 1;
+}
+
+message SnapshotMountsResponse {
+    repeated SnapshotMount mounts = 1;
+}
+
+message CommitSnapshotRequest {
+    string key = 1;
+    string active_key = 2;
+    map<string, string> labels = 3;
+}
+
+message CommitSnapshotResponse {}
+
+message RemoveSnapshotRequest {
+    string key = 1;
+}
+
+message RemoveSnapshotResponse {}
+
+message StatSnapshotRequest {
+    string key = 1;
+}
+
+message StatSnapshotResponse {
+    SnapshotInfo info = 1;
+}
+
+message ListSnapshotsRequest {
+    string parent_filter = 1;
+}
+
+message ListSnapshotsResponse {
+    repeated SnapshotInfo infos = 1;
+}
+
+message SnapshotUsageRequest {
+    string key = 1;
+}
+
+message SnapshotUsageResponse {
+    int64 size = 1;
+    int64 inodes = 2;
+}
+
+message CleanupSnapshotsRequest {}
+
+message CleanupSnapshotsResponse {
+    int64 reclaimed_bytes = 1;
+}
+
+message ExtractLayerRequest {
+    string digest = 1;
+    string parent_key = 2;
+    string key = 3;
+    map<string, string> labels = 4;
+}
+
+message ExtractLayerResponse {
+    string key = 1;
+    int64 size = 2;
+}

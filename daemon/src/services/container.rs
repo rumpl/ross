@@ -45,8 +45,14 @@ impl GrpcContainerService for ContainerServiceGrpc {
             } else {
                 Some(req.name)
             },
-            config: req.config.map(container_config_from_grpc).unwrap_or_default(),
-            host_config: req.host_config.map(host_config_from_grpc).unwrap_or_default(),
+            config: req
+                .config
+                .map(container_config_from_grpc)
+                .unwrap_or_default(),
+            host_config: req
+                .host_config
+                .map(host_config_from_grpc)
+                .unwrap_or_default(),
             networking_config: req
                 .networking_config
                 .map(networking_config_from_grpc)
@@ -320,7 +326,9 @@ impl GrpcContainerService for ContainerServiceGrpc {
 
         Ok(Response::new(WaitContainerResponse {
             status_code: result.status_code,
-            error: result.error.map(|msg| ross_core::WaitError { message: msg }),
+            error: result
+                .error
+                .map(|msg| ross_core::WaitError { message: msg }),
         }))
     }
 
@@ -401,7 +409,11 @@ fn into_status(e: ross_container::ContainerError) -> Status {
         ross_container::ContainerError::InvalidArgument(_) => {
             Status::invalid_argument(e.to_string())
         }
-        ross_container::ContainerError::Io(_) => Status::internal(e.to_string()),
+        ross_container::ContainerError::ImageNotFound(_) => Status::not_found(e.to_string()),
+        ross_container::ContainerError::Io(_)
+        | ross_container::ContainerError::Shim(_)
+        | ross_container::ContainerError::Snapshotter(_)
+        | ross_container::ContainerError::Store(_) => Status::internal(e.to_string()),
     }
 }
 
@@ -435,7 +447,11 @@ fn host_config_from_grpc(h: ross_core::HostConfig) -> ross_container::HostConfig
     ross_container::HostConfig {
         binds: h.binds,
         network_mode: h.network_mode,
-        port_bindings: h.port_bindings.into_iter().map(port_binding_from_grpc).collect(),
+        port_bindings: h
+            .port_bindings
+            .into_iter()
+            .map(port_binding_from_grpc)
+            .collect(),
         auto_remove: h.auto_remove,
         privileged: h.privileged,
         publish_all_ports: h.publish_all_ports,
@@ -592,7 +608,11 @@ fn host_config_to_grpc(h: ross_container::HostConfig) -> ross_core::HostConfig {
     ross_core::HostConfig {
         binds: h.binds,
         network_mode: h.network_mode,
-        port_bindings: h.port_bindings.into_iter().map(port_binding_to_grpc).collect(),
+        port_bindings: h
+            .port_bindings
+            .into_iter()
+            .map(port_binding_to_grpc)
+            .collect(),
         auto_remove: h.auto_remove,
         privileged: h.privileged,
         publish_all_ports: h.publish_all_ports,

@@ -1,17 +1,37 @@
 use crate::error::ContainerError;
 use crate::types::*;
 use async_stream::stream;
+use ross_shim::{CreateContainerOpts, RuncShim};
+use ross_snapshotter::OverlaySnapshotter;
+use ross_store::FileSystemStore;
+use std::collections::HashMap;
+use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use tokio_stream::Stream;
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
 
-#[derive(Default)]
-pub struct ContainerService;
+pub struct ContainerService {
+    shim: Arc<RuncShim>,
+    snapshotter: Arc<OverlaySnapshotter>,
+    #[allow(dead_code)]
+    store: Arc<FileSystemStore>,
+}
 
 impl ContainerService {
-    pub fn new() -> Self {
-        Self
+    pub async fn new(
+        data_dir: &Path,
+        snapshotter: Arc<OverlaySnapshotter>,
+        store: Arc<FileSystemStore>,
+    ) -> Result<Self, ContainerError> {
+        let shim = RuncShim::new(&data_dir.join("shim")).await?;
+
+        Ok(Self {
+            shim: Arc::new(shim),
+            snapshotter,
+            store,
+        })
     }
 
     pub async fn create(
@@ -19,14 +39,148 @@ impl ContainerService {
         params: CreateContainerParams,
     ) -> Result<CreateContainerResult, ContainerError> {
         tracing::info!("Creating container with name: {:?}", params.name);
+
+        let image_ref = &params.config.image;
+        tracing::info!("Looking up image: {}", image_ref);
+
+        // Look up the image's top layer digest from the store
+        let top_layer_digest = self.get_image_top_layer(image_ref).await?;
+        tracing::info!("Found top layer: {}", top_layer_digest);
+
+        // Verify the layer snapshot exists
+        if self.snapshotter.stat(&top_layer_digest).await.is_err() {
+            return Err(ContainerError::ImageNotFound(format!(
+                "Layer snapshot not found: {}. Did you pull the image first?",
+                top_layer_digest
+            )));
+        }
+
+        let snapshot_key = format!("container-{}", uuid::Uuid::new_v4());
+
+        let mut labels = HashMap::new();
+        labels.insert("container".to_string(), "true".to_string());
+        labels.insert("image".to_string(), image_ref.clone());
+
+        tracing::info!(
+            "Creating container snapshot {} from layer {}",
+            snapshot_key,
+            top_layer_digest
+        );
+
+        let mounts = self
+            .snapshotter
+            .prepare(&snapshot_key, Some(&top_layer_digest), labels)
+            .await?;
+
+        let rootfs_path = if let Some(mount) = mounts.first() {
+            mount.source.clone()
+        } else {
+            return Err(ContainerError::InvalidArgument(
+                "No mounts returned from snapshotter".to_string(),
+            ));
+        };
+
+        tracing::info!("Container rootfs path: {}", rootfs_path);
+
+        let shim_config = ross_shim::ContainerConfig {
+            image: params.config.image.clone(),
+            hostname: if params.config.hostname.is_empty() {
+                None
+            } else {
+                Some(params.config.hostname.clone())
+            },
+            user: if params.config.user.is_empty() {
+                None
+            } else {
+                Some(params.config.user.clone())
+            },
+            env: params.config.env.clone(),
+            cmd: params.config.cmd.clone(),
+            entrypoint: params.config.entrypoint.clone(),
+            working_dir: if params.config.working_dir.is_empty() {
+                None
+            } else {
+                Some(params.config.working_dir.clone())
+            },
+            labels: params.config.labels.clone(),
+            tty: params.config.tty,
+            open_stdin: params.config.open_stdin,
+        };
+
+        let shim_host_config = ross_shim::HostConfig {
+            binds: params.host_config.binds.clone(),
+            network_mode: if params.host_config.network_mode.is_empty() {
+                None
+            } else {
+                Some(params.host_config.network_mode.clone())
+            },
+            privileged: params.host_config.privileged,
+            readonly_rootfs: params.host_config.readonly_rootfs,
+            auto_remove: params.host_config.auto_remove,
+        };
+
+        let opts = CreateContainerOpts {
+            name: params.name.clone(),
+            config: shim_config,
+            host_config: shim_host_config,
+            rootfs_path,
+        };
+
+        let id = self.shim.create(opts).await?;
+
         Ok(CreateContainerResult {
-            id: "stub-container-id".to_string(),
+            id,
             warnings: vec![],
+        })
+    }
+
+    async fn get_image_top_layer(&self, image_ref: &str) -> Result<String, ContainerError> {
+        // Parse the image reference to find repository and tag
+        let (repository, tag) = parse_image_reference(image_ref);
+        
+        tracing::debug!("Looking up image {}:{}", repository, tag);
+
+        // Get the manifest digest for this tag
+        let tags = self.store.list_tags(&repository).await.map_err(|e| {
+            ContainerError::ImageNotFound(format!("Failed to list tags for {}: {}", repository, e))
+        })?;
+
+        let tag_info = tags.iter().find(|t| t.tag == tag).ok_or_else(|| {
+            ContainerError::ImageNotFound(format!("Tag {} not found for repository {}", tag, repository))
+        })?;
+
+        let manifest_digest = tag_info.digest.as_ref().ok_or_else(|| {
+            ContainerError::ImageNotFound(format!("No digest for tag {}:{}", repository, tag))
+        })?;
+
+        // Get the manifest
+        let (manifest_bytes, _media_type) = self.store.get_manifest(manifest_digest).await.map_err(|e| {
+            ContainerError::ImageNotFound(format!("Failed to get manifest: {}", e))
+        })?;
+
+        // Parse manifest to get layers
+        #[derive(serde::Deserialize)]
+        struct Manifest {
+            layers: Vec<Layer>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Layer {
+            digest: String,
+        }
+
+        let manifest: Manifest = serde_json::from_slice(&manifest_bytes).map_err(|e| {
+            ContainerError::ImageNotFound(format!("Failed to parse manifest: {}", e))
+        })?;
+
+        // Return the top (last) layer digest
+        manifest.layers.last().map(|l| l.digest.clone()).ok_or_else(|| {
+            ContainerError::ImageNotFound("Image has no layers".to_string())
         })
     }
 
     pub async fn start(&self, container_id: &str) -> Result<(), ContainerError> {
         tracing::info!("Starting container: {}", container_id);
+        self.shim.start(container_id).await?;
         Ok(())
     }
 
@@ -36,6 +190,7 @@ impl ContainerService {
             container_id,
             timeout
         );
+        self.shim.stop(container_id, timeout as u32).await?;
         Ok(())
     }
 
@@ -45,6 +200,8 @@ impl ContainerService {
             container_id,
             timeout
         );
+        self.shim.stop(container_id, timeout as u32).await?;
+        self.shim.start(container_id).await?;
         Ok(())
     }
 
@@ -57,27 +214,94 @@ impl ContainerService {
             params.all,
             params.limit
         );
-        Ok(vec![])
+
+        let containers = self.shim.list().await?;
+
+        let mut result: Vec<Container> = containers
+            .into_iter()
+            .filter(|c| params.all || c.state == ross_shim::ContainerState::Running)
+            .map(|c| Container {
+                id: c.id.clone(),
+                names: c.name.map(|n| vec![n]).unwrap_or_default(),
+                image: c.image.clone(),
+                image_id: String::new(),
+                command: String::new(),
+                created: Some(prost_types::Timestamp {
+                    seconds: c.created_at,
+                    nanos: 0,
+                }),
+                state: c.state.to_string(),
+                status: c.state.to_string(),
+                ports: vec![],
+                labels: std::collections::HashMap::new(),
+                size_rw: 0,
+                size_root_fs: 0,
+            })
+            .collect();
+
+        if params.limit > 0 {
+            result.truncate(params.limit as usize);
+        }
+
+        Ok(result)
     }
 
-    pub async fn inspect(
-        &self,
-        container_id: &str,
-    ) -> Result<ContainerInspection, ContainerError> {
+    pub async fn inspect(&self, container_id: &str) -> Result<ContainerInspection, ContainerError> {
         tracing::info!("Inspecting container: {}", container_id);
+
+        let info = self.shim.get(container_id).await?;
+
+        let state = ContainerState {
+            status: info.state.to_string(),
+            running: info.state == ross_shim::ContainerState::Running,
+            paused: info.state == ross_shim::ContainerState::Paused,
+            restarting: false,
+            oom_killed: false,
+            dead: false,
+            pid: info.pid.map(|p| p as i32).unwrap_or(0),
+            exit_code: info.exit_code.unwrap_or(0),
+            error: String::new(),
+            started_at: info.started_at.map(|t| prost_types::Timestamp {
+                seconds: t,
+                nanos: 0,
+            }),
+            finished_at: info.finished_at.map(|t| prost_types::Timestamp {
+                seconds: t,
+                nanos: 0,
+            }),
+        };
+
+        let container = Container {
+            id: info.id.clone(),
+            names: info.name.clone().map(|n| vec![n]).unwrap_or_default(),
+            image: info.image.clone(),
+            image_id: String::new(),
+            command: String::new(),
+            created: Some(prost_types::Timestamp {
+                seconds: info.created_at,
+                nanos: 0,
+            }),
+            state: info.state.to_string(),
+            status: info.state.to_string(),
+            ports: vec![],
+            labels: std::collections::HashMap::new(),
+            size_rw: 0,
+            size_root_fs: 0,
+        };
+
         Ok(ContainerInspection {
-            container: Container::default(),
-            state: ContainerState::default(),
+            container,
+            state,
             path: String::new(),
             args: vec![],
             resolv_conf_path: String::new(),
             hostname_path: String::new(),
             hosts_path: String::new(),
             log_path: String::new(),
-            name: String::new(),
+            name: info.name.unwrap_or_default(),
             restart_count: 0,
-            driver: String::new(),
-            platform: String::new(),
+            driver: "overlay".to_string(),
+            platform: "linux".to_string(),
             mount_label: String::new(),
             process_label: String::new(),
             app_armor_profile: String::new(),
@@ -91,24 +315,22 @@ impl ContainerService {
         &self,
         container_id: &str,
         force: bool,
-        remove_volumes: bool,
+        _remove_volumes: bool,
     ) -> Result<(), ContainerError> {
-        tracing::info!(
-            "Removing container: {} (force: {}, volumes: {})",
-            container_id,
-            force,
-            remove_volumes
-        );
+        tracing::info!("Removing container: {} (force: {})", container_id, force);
+        self.shim.delete(container_id, force).await?;
         Ok(())
     }
 
     pub async fn pause(&self, container_id: &str) -> Result<(), ContainerError> {
         tracing::info!("Pausing container: {}", container_id);
+        self.shim.pause(container_id).await?;
         Ok(())
     }
 
     pub async fn unpause(&self, container_id: &str) -> Result<(), ContainerError> {
         tracing::info!("Unpausing container: {}", container_id);
+        self.shim.resume(container_id).await?;
         Ok(())
     }
 
@@ -208,16 +430,15 @@ impl ContainerService {
     pub async fn wait(
         &self,
         container_id: &str,
-        condition: &str,
+        _condition: &str,
     ) -> Result<WaitResult, ContainerError> {
-        tracing::info!(
-            "Waiting for container: {} with condition: {}",
-            container_id,
-            condition
-        );
+        tracing::info!("Waiting for container: {}", container_id);
+
+        let result = self.shim.wait(container_id).await?;
+
         Ok(WaitResult {
-            status_code: 0,
-            error: None,
+            status_code: result.exit_code as i64,
+            error: result.error,
         })
     }
 
@@ -227,14 +448,14 @@ impl ContainerService {
             container_id,
             signal
         );
+
+        let sig = parse_signal(signal);
+        self.shim.kill(container_id, sig).await?;
+
         Ok(())
     }
 
-    pub async fn rename(
-        &self,
-        container_id: &str,
-        new_name: &str,
-    ) -> Result<(), ContainerError> {
+    pub async fn rename(&self, container_id: &str, new_name: &str) -> Result<(), ContainerError> {
         tracing::info!("Renaming container: {} to: {}", container_id, new_name);
         Ok(())
     }
@@ -279,5 +500,59 @@ impl ContainerService {
         };
 
         Box::pin(output)
+    }
+}
+
+fn parse_image_reference(image: &str) -> (String, String) {
+    let image = image.trim();
+    
+    // Extract tag/digest
+    let (name_part, tag) = if let Some(at_idx) = image.rfind('@') {
+        (&image[..at_idx], &image[at_idx + 1..])
+    } else if let Some(colon_idx) = image.rfind(':') {
+        let potential_tag = &image[colon_idx + 1..];
+        if !potential_tag.contains('/') {
+            (&image[..colon_idx], potential_tag)
+        } else {
+            (image, "latest")
+        }
+    } else {
+        (image, "latest")
+    };
+    
+    // Determine repository - need to match how the store indexes images
+    // The store uses the format from ImageReference which stores:
+    // - "library/nginx" for "nginx"
+    // - "myuser/myimage" for "myuser/myimage"
+    let repository = if name_part.contains('/') {
+        let first_slash = name_part.find('/').unwrap();
+        let first_part = &name_part[..first_slash];
+        
+        // Check if first part is a registry
+        if first_part.contains('.') || first_part.contains(':') || first_part == "localhost" {
+            // Has registry - repository is everything after first /
+            name_part[first_slash + 1..].to_string()
+        } else {
+            // No registry, whole thing is repository
+            name_part.to_string()
+        }
+    } else {
+        // Simple name like "nginx" -> "library/nginx"
+        format!("library/{}", name_part)
+    };
+    
+    (repository, tag.to_string())
+}
+
+fn parse_signal(signal: &str) -> u32 {
+    match signal.to_uppercase().as_str() {
+        "SIGKILL" | "KILL" | "9" => 9,
+        "SIGTERM" | "TERM" | "15" => 15,
+        "SIGINT" | "INT" | "2" => 2,
+        "SIGHUP" | "HUP" | "1" => 1,
+        "SIGQUIT" | "QUIT" | "3" => 3,
+        "SIGUSR1" | "USR1" | "10" => 10,
+        "SIGUSR2" | "USR2" | "12" => 12,
+        _ => signal.parse().unwrap_or(15),
     }
 }

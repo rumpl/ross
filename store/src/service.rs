@@ -5,10 +5,10 @@ use crate::{
     DeleteTagResponse, GarbageCollectRequest, GarbageCollectResponse, GetBlobRequest,
     GetImageIndexRequest, GetImageIndexResponse, GetManifestRequest, GetManifestResponse,
     GetStoreInfoRequest, GetStoreInfoResponse, ImageIndex, ListBlobsRequest, ListBlobsResponse,
-    ListManifestsRequest, ListManifestsResponse, ListTagsRequest, ListTagsResponse,
-    PutBlobRequest, PutBlobResponse, PutImageIndexRequest, PutImageIndexResponse,
-    PutManifestRequest, PutManifestResponse, ResolveTagRequest, ResolveTagResponse, SetTagRequest,
-    SetTagResponse, StatBlobRequest, StatBlobResponse, StoreService,
+    ListManifestsRequest, ListManifestsResponse, ListTagsRequest, ListTagsResponse, PutBlobRequest,
+    PutBlobResponse, PutImageIndexRequest, PutImageIndexResponse, PutManifestRequest,
+    PutManifestResponse, ResolveTagRequest, ResolveTagResponse, SetTagRequest, SetTagResponse,
+    StatBlobRequest, StatBlobResponse, StoreService,
 };
 use async_stream::try_stream;
 use std::pin::Pin;
@@ -39,7 +39,9 @@ impl StoreService for StoreServiceImpl {
         request: Request<GetBlobRequest>,
     ) -> Result<Response<Self::GetBlobStream>, Status> {
         let req = request.into_inner();
-        let digest = req.digest.ok_or_else(|| Status::invalid_argument("digest required"))?;
+        let digest = req
+            .digest
+            .ok_or_else(|| Status::invalid_argument("digest required"))?;
 
         let data = self
             .store
@@ -107,7 +109,9 @@ impl StoreService for StoreServiceImpl {
         request: Request<StatBlobRequest>,
     ) -> Result<Response<StatBlobResponse>, Status> {
         let req = request.into_inner();
-        let digest = req.digest.ok_or_else(|| Status::invalid_argument("digest required"))?;
+        let digest = req
+            .digest
+            .ok_or_else(|| Status::invalid_argument("digest required"))?;
 
         let info = self.store.stat_blob(&digest).await.map_err(Status::from)?;
 
@@ -122,9 +126,15 @@ impl StoreService for StoreServiceImpl {
         request: Request<DeleteBlobRequest>,
     ) -> Result<Response<DeleteBlobResponse>, Status> {
         let req = request.into_inner();
-        let digest = req.digest.ok_or_else(|| Status::invalid_argument("digest required"))?;
+        let digest = req
+            .digest
+            .ok_or_else(|| Status::invalid_argument("digest required"))?;
 
-        let deleted = self.store.delete_blob(&digest).await.map_err(Status::from)?;
+        let deleted = self
+            .store
+            .delete_blob(&digest)
+            .await
+            .map_err(Status::from)?;
 
         Ok(Response::new(DeleteBlobResponse { deleted }))
     }
@@ -153,7 +163,9 @@ impl StoreService for StoreServiceImpl {
         request: Request<GetManifestRequest>,
     ) -> Result<Response<GetManifestResponse>, Status> {
         let req = request.into_inner();
-        let digest = req.digest.ok_or_else(|| Status::invalid_argument("digest required"))?;
+        let digest = req
+            .digest
+            .ok_or_else(|| Status::invalid_argument("digest required"))?;
 
         let (content, media_type) = self
             .store
@@ -191,9 +203,15 @@ impl StoreService for StoreServiceImpl {
         request: Request<DeleteManifestRequest>,
     ) -> Result<Response<DeleteManifestResponse>, Status> {
         let req = request.into_inner();
-        let digest = req.digest.ok_or_else(|| Status::invalid_argument("digest required"))?;
+        let digest = req
+            .digest
+            .ok_or_else(|| Status::invalid_argument("digest required"))?;
 
-        let deleted = self.store.delete_manifest(&digest).await.map_err(Status::from)?;
+        let deleted = self
+            .store
+            .delete_manifest(&digest)
+            .await
+            .map_err(Status::from)?;
 
         Ok(Response::new(DeleteManifestResponse { deleted }))
     }
@@ -209,7 +227,11 @@ impl StoreService for StoreServiceImpl {
             Some(req.media_type_filter.as_str())
         };
 
-        let manifests = self.store.list_manifests(filter).await.map_err(Status::from)?;
+        let manifests = self
+            .store
+            .list_manifests(filter)
+            .await
+            .map_err(Status::from)?;
 
         Ok(Response::new(ListManifestsResponse {
             manifests,
@@ -222,7 +244,9 @@ impl StoreService for StoreServiceImpl {
         request: Request<GetImageIndexRequest>,
     ) -> Result<Response<GetImageIndexResponse>, Status> {
         let req = request.into_inner();
-        let digest = req.digest.ok_or_else(|| Status::invalid_argument("digest required"))?;
+        let digest = req
+            .digest
+            .ok_or_else(|| Status::invalid_argument("digest required"))?;
 
         let content = self.store.get_index(&digest).await.map_err(Status::from)?;
 
@@ -240,10 +264,11 @@ impl StoreService for StoreServiceImpl {
         request: Request<PutImageIndexRequest>,
     ) -> Result<Response<PutImageIndexResponse>, Status> {
         let req = request.into_inner();
-        let index = req.index.ok_or_else(|| Status::invalid_argument("index required"))?;
+        let index = req
+            .index
+            .ok_or_else(|| Status::invalid_argument("index required"))?;
 
-        let content =
-            serde_json::to_vec(&index).map_err(|e| Status::internal(e.to_string()))?;
+        let content = serde_json::to_vec(&index).map_err(|e| Status::internal(e.to_string()))?;
 
         let (digest, size) = self.store.put_index(&content).await.map_err(Status::from)?;
 
@@ -258,9 +283,15 @@ impl StoreService for StoreServiceImpl {
         request: Request<DeleteImageIndexRequest>,
     ) -> Result<Response<DeleteImageIndexResponse>, Status> {
         let req = request.into_inner();
-        let digest = req.digest.ok_or_else(|| Status::invalid_argument("digest required"))?;
+        let digest = req
+            .digest
+            .ok_or_else(|| Status::invalid_argument("digest required"))?;
 
-        let deleted = self.store.delete_index(&digest).await.map_err(Status::from)?;
+        let deleted = self
+            .store
+            .delete_index(&digest)
+            .await
+            .map_err(Status::from)?;
 
         Ok(Response::new(DeleteImageIndexResponse { deleted }))
     }
@@ -288,7 +319,9 @@ impl StoreService for StoreServiceImpl {
         request: Request<SetTagRequest>,
     ) -> Result<Response<SetTagResponse>, Status> {
         let req = request.into_inner();
-        let digest = req.digest.ok_or_else(|| Status::invalid_argument("digest required"))?;
+        let digest = req
+            .digest
+            .ok_or_else(|| Status::invalid_argument("digest required"))?;
 
         let previous = self
             .store

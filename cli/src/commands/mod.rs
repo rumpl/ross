@@ -1,7 +1,9 @@
 pub mod container;
 pub mod health;
 pub mod image;
+pub mod run;
 
-pub use container::{handle_container_command, ContainerCommands};
+pub use container::{ContainerCommands, handle_container_command};
 pub use health::health_check;
-pub use image::{handle_image_command, ImageCommands};
+pub use image::{ImageCommands, handle_image_command};
+pub use run::run_container;

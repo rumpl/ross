@@ -1,8 +1,8 @@
 use clap::Subcommand;
 use ross_core::ross::image_service_client::ImageServiceClient;
 use ross_core::ross::{
-    BuildImageRequest, InspectImageRequest, ListImagesRequest, PullImageProgress,
-    PullImageRequest, PushImageRequest, RemoveImageRequest, SearchImagesRequest, TagImageRequest,
+    BuildImageRequest, InspectImageRequest, ListImagesRequest, PullImageProgress, PullImageRequest,
+    PushImageRequest, RemoveImageRequest, SearchImagesRequest, TagImageRequest,
 };
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
@@ -197,7 +197,10 @@ async fn image_list(
                     "<none>", "<none>", digest, id_short, size
                 );
             } else {
-                println!("{:<40} {:<15} {:<15} {:<10}", "<none>", "<none>", id_short, size);
+                println!(
+                    "{:<40} {:<15} {:<15} {:<10}",
+                    "<none>", "<none>", id_short, size
+                );
             }
         } else {
             for repo_tag in &image.repo_tags {
@@ -309,9 +312,7 @@ impl PullProgressDisplay {
     fn update(&mut self, progress: &PullImageProgress) {
         let id = &progress.id;
 
-        if progress.status.starts_with("Resolving")
-            || progress.status.starts_with("Resolved")
-        {
+        if progress.status.starts_with("Resolving") || progress.status.starts_with("Resolved") {
             if self.is_tty {
                 self.clear_lines();
                 println!("{}: {}", id, progress.status);
@@ -324,7 +325,8 @@ impl PullProgressDisplay {
         }
 
         if progress.status.starts_with("Digest:") || progress.status.starts_with("Status:") {
-            self.footer_lines.push(format!("{}: {}", id, progress.status));
+            self.footer_lines
+                .push(format!("{}: {}", id, progress.status));
             if self.is_tty {
                 self.clear_lines();
                 self.redraw_all();
@@ -350,9 +352,8 @@ impl PullProgressDisplay {
             || progress.status == "Already exists"
             || !progress.error.is_empty();
 
-        let is_final_state = done
-            || progress.status == "Downloading"
-            || progress.status == "Pulling config";
+        let is_final_state =
+            done || progress.status == "Downloading" || progress.status == "Pulling config";
 
         if let Some(state) = self.layers.get_mut(id) {
             state.status = if !progress.error.is_empty() {
@@ -367,9 +368,7 @@ impl PullProgressDisplay {
         if self.is_tty {
             self.clear_lines();
             self.redraw_all();
-        } else if is_final_state
-            && let Some(state) = self.layers.get(id)
-        {
+        } else if is_final_state && let Some(state) = self.layers.get(id) {
             println!("{}: {}", id, state.status);
         }
     }
@@ -403,7 +402,10 @@ impl PullProgressDisplay {
                 };
 
                 let line = if !state.progress.is_empty() {
-                    format!("{} {}: {} {}", status_icon, id, state.status, state.progress)
+                    format!(
+                        "{} {}: {} {}",
+                        status_icon, id, state.status, state.progress
+                    )
                 } else {
                     format!("{} {}: {}", status_icon, id, state.status)
                 };

@@ -1,5 +1,5 @@
-use ross_core::ross::ross_client::RossClient;
 use ross_core::ross::HealthCheckRequest;
+use ross_core::ross::ross_client::RossClient;
 
 pub async fn health_check(addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut client = RossClient::connect(addr.to_string()).await.map_err(|e| {

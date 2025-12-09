@@ -1,8 +1,8 @@
 use crate::error::RegistryError;
 use crate::reference::ImageReference;
 use crate::types::*;
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION};
 use reqwest::Client;
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -13,9 +13,7 @@ pub struct RegistryClient {
 
 impl RegistryClient {
     pub fn new() -> Result<Self, RegistryError> {
-        let client = Client::builder()
-            .user_agent("ross/0.1.0")
-            .build()?;
+        let client = Client::builder().user_agent("ross/0.1.0").build()?;
 
         Ok(Self {
             client,
@@ -37,7 +35,11 @@ impl RegistryClient {
         Ok(tokens.get(&key).cloned())
     }
 
-    async fn authenticate(&self, reference: &ImageReference, www_auth: &str) -> Result<String, RegistryError> {
+    async fn authenticate(
+        &self,
+        reference: &ImageReference,
+        www_auth: &str,
+    ) -> Result<String, RegistryError> {
         let realm = extract_auth_param(www_auth, "realm")
             .ok_or_else(|| RegistryError::AuthFailed("no realm in www-authenticate".to_string()))?;
         let service = extract_auth_param(www_auth, "service");
@@ -82,10 +84,7 @@ impl RegistryClient {
         accept: &[&str],
     ) -> Result<reqwest::Response, RegistryError> {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            ACCEPT,
-            HeaderValue::from_str(&accept.join(", ")).unwrap(),
-        );
+        headers.insert(ACCEPT, HeaderValue::from_str(&accept.join(", ")).unwrap());
 
         if let Some(token) = self.get_token(reference).await? {
             headers.insert(
@@ -163,13 +162,14 @@ impl RegistryClient {
 
         let body = response.text().await?;
 
-        let manifest = if content_type.contains("manifest.list") || content_type.contains("image.index") {
-            let list: ManifestList = serde_json::from_str(&body)?;
-            Manifest::List(list)
-        } else {
-            let v2: ManifestV2 = serde_json::from_str(&body)?;
-            Manifest::V2(v2)
-        };
+        let manifest =
+            if content_type.contains("manifest.list") || content_type.contains("image.index") {
+                let list: ManifestList = serde_json::from_str(&body)?;
+                Manifest::List(list)
+            } else {
+                let v2: ManifestV2 = serde_json::from_str(&body)?;
+                Manifest::V2(v2)
+            };
 
         Ok((manifest, content_type, digest))
     }
@@ -196,10 +196,7 @@ impl RegistryClient {
                         }
                     })
                     .ok_or_else(|| {
-                        RegistryError::ManifestNotFound(format!(
-                            "no manifest for {}/{}",
-                            os, arch
-                        ))
+                        RegistryError::ManifestNotFound(format!("no manifest for {}/{}", os, arch))
                     })?;
 
                 let mut ref_with_digest = reference.clone();

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["core", "cli", "container", "daemon", "image", "store", "remote"]
+members = ["core", "cli", "container", "daemon", "image", "store", "remote", "snapshotter", "shim"]
 
 [workspace.package]
 version = "0.1.0"
