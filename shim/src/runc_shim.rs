@@ -4,6 +4,7 @@ use oci_spec::runtime::{
     LinuxBuilder, LinuxNamespace, LinuxNamespaceBuilder, LinuxNamespaceType, Mount, MountBuilder,
     ProcessBuilder, RootBuilder, Spec, SpecBuilder,
 };
+use ross_mount::MountSpec;
 use runc::options::{CreateOpts, DeleteOpts, GlobalOpts, KillOpts};
 use runc::Runc;
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,8 @@ impl RuncShim {
 
         let runc = GlobalOpts::new()
             .root(data_dir.join("runc"))
+            .debug(true)
+            .log(data_dir.join("runc.log"))
             .build()
             .map_err(|e| ShimError::Runc(e.to_string()))?;
 
@@ -87,11 +90,18 @@ impl RuncShim {
         }
 
         let bundle_path = self.data_dir.join("containers").join(&id).join("bundle");
+        let rootfs_path = bundle_path.join("rootfs");
         fs::create_dir_all(&bundle_path).await?;
+        fs::create_dir_all(&rootfs_path).await?;
 
-        let spec = self.generate_spec(&opts, &opts.rootfs_path)?;
+        // Mount the rootfs using the snapshotter mount specification
+        self.mount_rootfs(&opts.mounts, &rootfs_path).await?;
+
+        let spec = self.generate_spec(&opts, &rootfs_path)?;
+        tracing::info!("Generated OCI spec with args: {:?}", spec.process().as_ref().and_then(|p| p.args().as_ref()));
         let spec_path = bundle_path.join("config.json");
         let spec_content = serde_json::to_string_pretty(&spec)?;
+        tracing::debug!("OCI spec content: {}", &spec_content);
         fs::write(&spec_path, spec_content).await?;
 
         let now = SystemTime::now()
@@ -110,7 +120,7 @@ impl RuncShim {
             started_at: None,
             finished_at: None,
             bundle_path: bundle_path.to_string_lossy().to_string(),
-            rootfs_path: opts.rootfs_path.clone(),
+            rootfs_path: rootfs_path.to_string_lossy().to_string(),
         };
 
         let metadata = ContainerMetadata {
@@ -119,11 +129,41 @@ impl RuncShim {
             host_config: opts.host_config,
         };
 
-        let create_opts = CreateOpts::new().pid_file(bundle_path.join("container.pid"));
-
-        self.runc
-            .create(&id, &bundle_path, Some(&create_opts))
-            .await?;
+        tracing::info!(container_id = %id, bundle = ?bundle_path, "Calling runc create");
+        
+        // Call runc directly
+        let runc_root = self.data_dir.join("runc");
+        let pid_file = bundle_path.join("container.pid");
+        
+        let mut child = tokio::process::Command::new("runc")
+            .arg("--root")
+            .arg(&runc_root)
+            .arg("create")
+            .arg("--bundle")
+            .arg(&bundle_path)
+            .arg("--pid-file")
+            .arg(&pid_file)
+            .arg("--no-pivot")
+            .arg(&id)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| ShimError::Runc(format!("Failed to spawn runc: {}", e)))?;
+        
+        tracing::info!(container_id = %id, "runc spawned, waiting for completion");
+        
+        // Use wait() instead of wait_with_output() because runc init inherits our pipes
+        // and keeps them open, which would cause wait_with_output() to block forever
+        let status = child.wait().await
+            .map_err(|e| ShimError::Runc(format!("Failed to wait for runc: {}", e)))?;
+        
+        if !status.success() {
+            tracing::error!(container_id = %id, status = ?status, "runc create failed");
+            return Err(ShimError::Runc(format!("runc create failed with status: {}", status)));
+        }
+        
+        tracing::info!(container_id = %id, "runc create completed successfully");
 
         self.save_container(&metadata).await?;
 
@@ -134,6 +174,31 @@ impl RuncShim {
 
         tracing::info!(container_id = %id, "Container created");
         Ok(id)
+    }
+
+    async fn mount_rootfs(
+        &self,
+        mounts: &[SnapshotMount],
+        target: &Path,
+    ) -> Result<(), ShimError> {
+        if mounts.is_empty() {
+            return Err(ShimError::Runc("No mounts provided".to_string()));
+        }
+
+        let mount = &mounts[0];
+        tracing::info!(
+            "Mounting rootfs: type={}, source={}, options={:?}",
+            mount.mount_type,
+            mount.source,
+            mount.options
+        );
+        
+        let spec = MountSpec::new(&mount.mount_type, &mount.source, mount.options.clone());
+
+        ross_mount::mount_overlay(&spec, target)
+            .map_err(|e| ShimError::Runc(format!("Failed to mount rootfs: {}", e)))?;
+
+        Ok(())
     }
 
     pub async fn start(&self, id: &str) -> Result<(), ShimError> {
@@ -218,6 +283,7 @@ impl RuncShim {
     }
 
     pub async fn delete(&self, id: &str, force: bool) -> Result<(), ShimError> {
+        let rootfs_path: PathBuf;
         {
             let containers = self.containers.read().await;
             let metadata = containers
@@ -230,10 +296,19 @@ impl RuncShim {
                     actual: "running".to_string(),
                 });
             }
+            
+            rootfs_path = PathBuf::from(&metadata.info.rootfs_path);
         }
 
         let delete_opts = DeleteOpts::new().force(force);
         self.runc.delete(id, Some(&delete_opts)).await?;
+
+        // Unmount the rootfs
+        if rootfs_path.exists() {
+            if let Err(e) = ross_mount::unmount(&rootfs_path) {
+                tracing::warn!("Failed to unmount rootfs: {}", e);
+            }
+        }
 
         let container_dir = self.data_dir.join("containers").join(id);
         if container_dir.exists() {
@@ -302,26 +377,75 @@ impl RuncShim {
     }
 
     pub async fn wait(&self, id: &str) -> Result<WaitResult, ShimError> {
+        let runc_root = self.data_dir.join("runc");
+        
         loop {
-            {
-                let containers = self.containers.read().await;
-                let metadata = containers
-                    .get(id)
-                    .ok_or_else(|| ShimError::ContainerNotFound(id.to_string()))?;
-
-                if metadata.info.state == ContainerState::Stopped {
-                    return Ok(WaitResult {
-                        exit_code: metadata.info.exit_code.unwrap_or(0),
-                        error: None,
-                    });
+            // Check runc state to see if container is still running
+            let output = tokio::process::Command::new("runc")
+                .arg("--root")
+                .arg(&runc_root)
+                .arg("state")
+                .arg(id)
+                .output()
+                .await
+                .map_err(|e| ShimError::Runc(format!("Failed to get runc state: {}", e)))?;
+            
+            if !output.status.success() {
+                // Container doesn't exist anymore - it has exited and been cleaned up
+                // or there's an error. Try to get exit code from events or assume 0
+                tracing::info!(container_id = %id, "Container no longer exists in runc");
+                
+                // Update internal state
+                let mut containers = self.containers.write().await;
+                if let Some(metadata) = containers.get_mut(id) {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64;
+                    metadata.info.state = ContainerState::Stopped;
+                    metadata.info.finished_at = Some(now);
+                    metadata.info.exit_code = Some(0); // TODO: get actual exit code
+                    let _ = self.save_container(metadata).await;
                 }
+                
+                return Ok(WaitResult {
+                    exit_code: 0,
+                    error: None,
+                });
+            }
+            
+            // Parse state JSON
+            let state_json: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .map_err(|e| ShimError::Runc(format!("Failed to parse runc state: {}", e)))?;
+            
+            let status = state_json["status"].as_str().unwrap_or("");
+            tracing::debug!(container_id = %id, status = %status, "Container status");
+            
+            if status == "stopped" {
+                // Update internal state
+                let mut containers = self.containers.write().await;
+                if let Some(metadata) = containers.get_mut(id) {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64;
+                    metadata.info.state = ContainerState::Stopped;
+                    metadata.info.finished_at = Some(now);
+                    metadata.info.exit_code = Some(0); // TODO: get actual exit code
+                    let _ = self.save_container(metadata).await;
+                }
+                
+                return Ok(WaitResult {
+                    exit_code: 0,
+                    error: None,
+                });
             }
 
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
     }
 
-    fn generate_spec(&self, opts: &CreateContainerOpts, rootfs: &str) -> Result<Spec, ShimError> {
+    fn generate_spec(&self, opts: &CreateContainerOpts, rootfs: &Path) -> Result<Spec, ShimError> {
         let args = if !opts.config.entrypoint.is_empty() {
             let mut args = opts.config.entrypoint.clone();
             args.extend(opts.config.cmd.clone());
@@ -348,7 +472,7 @@ impl RuncShim {
         let (uid, gid) = parse_user(&user);
 
         let process = ProcessBuilder::default()
-            .terminal(opts.config.tty)
+            .terminal(false)  // Disable TTY - requires console socket support
             .user(
                 oci_spec::runtime::UserBuilder::default()
                     .uid(uid)

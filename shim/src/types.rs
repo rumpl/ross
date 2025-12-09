@@ -66,7 +66,7 @@ pub struct CreateContainerOpts {
     pub mounts: Vec<SnapshotMount>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SnapshotMount {
     pub mount_type: String,
     pub source: String,

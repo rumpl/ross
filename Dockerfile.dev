@@ -25,25 +25,20 @@ COPY container/Cargo.toml container/Cargo.toml
 COPY core/Cargo.toml core/Cargo.toml
 COPY daemon/Cargo.toml daemon/Cargo.toml
 COPY image/Cargo.toml image/Cargo.toml
+COPY mount/Cargo.toml mount/Cargo.toml
 COPY remote/Cargo.toml remote/Cargo.toml
 COPY shim/Cargo.toml shim/Cargo.toml
 COPY snapshotter/Cargo.toml snapshotter/Cargo.toml
 COPY store/Cargo.toml store/Cargo.toml
 
-RUN mkdir -p cli/src container/src core/src daemon/src image/src remote/src shim/src snapshotter/src store/src && \
-    echo "fn main() {}" > cli/src/main.rs && \
-    echo "fn main() {}" > daemon/src/main.rs && \
-    touch container/src/lib.rs core/src/lib.rs image/src/lib.rs remote/src/lib.rs shim/src/lib.rs snapshotter/src/lib.rs store/src/lib.rs
-
 COPY proto proto
-
-RUN cargo build --release 2>/dev/null || true
-
 COPY . .
 
-RUN touch cli/src/main.rs daemon/src/main.rs container/src/lib.rs core/src/lib.rs image/src/lib.rs remote/src/lib.rs shim/src/lib.rs snapshotter/src/lib.rs store/src/lib.rs
-
-RUN cargo build --release
+RUN --mount=type=cache,target=/build/target \
+    --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo build --release && \
+    cp target/release/ross-daemon target/release/ross-cli /tmp/
 
 FROM alpine:latest
 
@@ -52,8 +47,8 @@ RUN apk add --no-cache \
     fuse-overlayfs \
     ca-certificates
 
-COPY --from=builder /build/target/release/ross-daemon /usr/local/bin/
-COPY --from=builder /build/target/release/ross-cli /usr/local/bin/
+COPY --from=builder /tmp/ross-daemon /usr/local/bin/
+COPY --from=builder /tmp/ross-cli /usr/local/bin/
 
 ENV RUST_LOG=info,ross=debug
 

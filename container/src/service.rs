@@ -12,6 +12,15 @@ use tokio_stream::Stream;
 
 type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
 
+struct ImageConfigInfo {
+    top_layer: Option<String>,
+    entrypoint: Vec<String>,
+    cmd: Vec<String>,
+    env: Vec<String>,
+    working_dir: String,
+    user: String,
+}
+
 pub struct ContainerService {
     shim: Arc<RuncShim>,
     snapshotter: Arc<OverlaySnapshotter>,
@@ -43,8 +52,12 @@ impl ContainerService {
         let image_ref = &params.config.image;
         tracing::info!("Looking up image: {}", image_ref);
 
-        // Look up the image's top layer digest from the store
-        let top_layer_digest = self.get_image_top_layer(image_ref).await?;
+        // Get image config (includes top layer and default entrypoint/cmd)
+        let image_config = self.get_image_config(image_ref).await?;
+        
+        let top_layer_digest = image_config.top_layer.ok_or_else(|| {
+            ContainerError::ImageNotFound("Image has no layers".to_string())
+        })?;
         tracing::info!("Found top layer: {}", top_layer_digest);
 
         // Verify the layer snapshot exists
@@ -72,15 +85,61 @@ impl ContainerService {
             .prepare(&snapshot_key, Some(&top_layer_digest), labels)
             .await?;
 
-        let rootfs_path = if let Some(mount) = mounts.first() {
-            mount.source.clone()
+        // Convert snapshotter mounts to shim mounts
+        let shim_mounts: Vec<ross_shim::SnapshotMount> = mounts
+            .iter()
+            .map(|m| ross_shim::SnapshotMount {
+                mount_type: m.mount_type.clone(),
+                source: m.source.clone(),
+                options: m.options.clone(),
+            })
+            .collect();
+
+        tracing::info!("Prepared {} mount(s) for container", shim_mounts.len());
+
+        // Merge user config with image config (user config takes precedence)
+        let entrypoint = if params.config.entrypoint.is_empty() {
+            image_config.entrypoint
         } else {
-            return Err(ContainerError::InvalidArgument(
-                "No mounts returned from snapshotter".to_string(),
-            ));
+            params.config.entrypoint.clone()
         };
 
-        tracing::info!("Container rootfs path: {}", rootfs_path);
+        let cmd = if params.config.cmd.is_empty() {
+            image_config.cmd
+        } else {
+            params.config.cmd.clone()
+        };
+
+        let env = if params.config.env.is_empty() {
+            image_config.env
+        } else {
+            // Merge: image env + user env (user overrides)
+            let mut merged = image_config.env;
+            merged.extend(params.config.env.clone());
+            merged
+        };
+
+        let working_dir = if params.config.working_dir.is_empty() {
+            if image_config.working_dir.is_empty() {
+                None
+            } else {
+                Some(image_config.working_dir)
+            }
+        } else {
+            Some(params.config.working_dir.clone())
+        };
+
+        let user = if params.config.user.is_empty() {
+            if image_config.user.is_empty() {
+                None
+            } else {
+                Some(image_config.user)
+            }
+        } else {
+            Some(params.config.user.clone())
+        };
+
+        tracing::info!("Container entrypoint: {:?}, cmd: {:?}", entrypoint, cmd);
 
         let shim_config = ross_shim::ContainerConfig {
             image: params.config.image.clone(),
@@ -89,19 +148,11 @@ impl ContainerService {
             } else {
                 Some(params.config.hostname.clone())
             },
-            user: if params.config.user.is_empty() {
-                None
-            } else {
-                Some(params.config.user.clone())
-            },
-            env: params.config.env.clone(),
-            cmd: params.config.cmd.clone(),
-            entrypoint: params.config.entrypoint.clone(),
-            working_dir: if params.config.working_dir.is_empty() {
-                None
-            } else {
-                Some(params.config.working_dir.clone())
-            },
+            user,
+            env,
+            cmd,
+            entrypoint,
+            working_dir,
             labels: params.config.labels.clone(),
             tty: params.config.tty,
             open_stdin: params.config.open_stdin,
@@ -123,7 +174,7 @@ impl ContainerService {
             name: params.name.clone(),
             config: shim_config,
             host_config: shim_host_config,
-            rootfs_path,
+            mounts: shim_mounts,
         };
 
         let id = self.shim.create(opts).await?;
@@ -135,12 +186,18 @@ impl ContainerService {
     }
 
     async fn get_image_top_layer(&self, image_ref: &str) -> Result<String, ContainerError> {
-        // Parse the image reference to find repository and tag
+        let image_config = self.get_image_config(image_ref).await?;
+        
+        image_config.top_layer.ok_or_else(|| {
+            ContainerError::ImageNotFound("Image has no layers".to_string())
+        })
+    }
+
+    async fn get_image_config(&self, image_ref: &str) -> Result<ImageConfigInfo, ContainerError> {
         let (repository, tag) = parse_image_reference(image_ref);
         
         tracing::debug!("Looking up image {}:{}", repository, tag);
 
-        // Get the manifest digest for this tag
         let tags = self.store.list_tags(&repository).await.map_err(|e| {
             ContainerError::ImageNotFound(format!("Failed to list tags for {}: {}", repository, e))
         })?;
@@ -153,18 +210,21 @@ impl ContainerService {
             ContainerError::ImageNotFound(format!("No digest for tag {}:{}", repository, tag))
         })?;
 
-        // Get the manifest
         let (manifest_bytes, _media_type) = self.store.get_manifest(manifest_digest).await.map_err(|e| {
             ContainerError::ImageNotFound(format!("Failed to get manifest: {}", e))
         })?;
 
-        // Parse manifest to get layers
         #[derive(serde::Deserialize)]
         struct Manifest {
-            layers: Vec<Layer>,
+            config: ConfigDescriptor,
+            layers: Vec<LayerDescriptor>,
         }
         #[derive(serde::Deserialize)]
-        struct Layer {
+        struct ConfigDescriptor {
+            digest: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct LayerDescriptor {
             digest: String,
         }
 
@@ -172,9 +232,55 @@ impl ContainerService {
             ContainerError::ImageNotFound(format!("Failed to parse manifest: {}", e))
         })?;
 
-        // Return the top (last) layer digest
-        manifest.layers.last().map(|l| l.digest.clone()).ok_or_else(|| {
-            ContainerError::ImageNotFound("Image has no layers".to_string())
+        let top_layer = manifest.layers.last().map(|l| l.digest.clone());
+
+        // Get the image config blob
+        let config_digest = ross_store::Digest {
+            algorithm: "sha256".to_string(),
+            hash: manifest.config.digest.trim_start_matches("sha256:").to_string(),
+        };
+
+        let config_bytes = self.store.get_blob(&config_digest, 0, -1).await.map_err(|e| {
+            ContainerError::ImageNotFound(format!("Failed to get image config: {}", e))
+        })?;
+
+        #[derive(serde::Deserialize)]
+        struct ImageConfig {
+            config: Option<ContainerConfigBlob>,
+        }
+        #[derive(serde::Deserialize)]
+        struct ContainerConfigBlob {
+            #[serde(rename = "Entrypoint")]
+            entrypoint: Option<Vec<String>>,
+            #[serde(rename = "Cmd")]
+            cmd: Option<Vec<String>>,
+            #[serde(rename = "Env")]
+            env: Option<Vec<String>>,
+            #[serde(rename = "WorkingDir")]
+            working_dir: Option<String>,
+            #[serde(rename = "User")]
+            user: Option<String>,
+        }
+
+        let image_config: ImageConfig = serde_json::from_slice(&config_bytes).map_err(|e| {
+            ContainerError::ImageNotFound(format!("Failed to parse image config: {}", e))
+        })?;
+
+        let container_config = image_config.config.unwrap_or(ContainerConfigBlob {
+            entrypoint: None,
+            cmd: None,
+            env: None,
+            working_dir: None,
+            user: None,
+        });
+
+        Ok(ImageConfigInfo {
+            top_layer,
+            entrypoint: container_config.entrypoint.unwrap_or_default(),
+            cmd: container_config.cmd.unwrap_or_default(),
+            env: container_config.env.unwrap_or_default(),
+            working_dir: container_config.working_dir.unwrap_or_default(),
+            user: container_config.user.unwrap_or_default(),
         })
     }
 

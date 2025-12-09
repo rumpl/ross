@@ -1712,6 +1712,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ross-mount"
+version = "0.1.0"
+dependencies = [
+ "nix 0.29.0",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "ross-remote"
 version = "0.1.0"
 dependencies = [
@@ -1733,6 +1742,7 @@ name = "ross-shim"
 version = "0.1.0"
 dependencies = [
  "oci-spec",
+ "ross-mount",
  "runc",
  "serde",
  "serde_json",

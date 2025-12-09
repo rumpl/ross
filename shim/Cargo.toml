@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 oci-spec = "0.7"
+ross-mount = { path = "../mount" }
 runc = { version = "0.3", features = ["async"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

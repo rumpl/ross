@@ -12,6 +12,7 @@ use ross_store::FileSystemStore;
 use services::{ContainerServiceGrpc, ImageServiceGrpc, RossService, SnapshotterServiceGrpc};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::signal;
 use tonic::transport::Server;
 use tracing_subscriber::EnvFilter;
 
@@ -102,7 +103,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .add_service(SnapshotterServiceServer::new(SnapshotterServiceGrpc::new(
                     snapshotter,
                 )))
-                .serve(addr)
+                .serve_with_shutdown(addr, async {
+                    signal::ctrl_c()
+                        .await
+                        .expect("failed to listen for ctrl-c");
+                    tracing::info!("Received shutdown signal, stopping server...");
+                })
                 .await?;
         }
     }
