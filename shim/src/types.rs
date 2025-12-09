@@ -78,3 +78,10 @@ pub struct WaitResult {
     pub exit_code: i32,
     pub error: Option<String>,
 }
+
+#[derive(Debug, Clone)]
+pub enum OutputEvent {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    Exit(WaitResult),
+}

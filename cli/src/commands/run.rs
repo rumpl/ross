@@ -3,7 +3,9 @@ use ross_core::ross::image_service_client::ImageServiceClient;
 use ross_core::ross::{
     ContainerConfig, CreateContainerRequest, HostConfig, PortBinding, PullImageRequest,
     RemoveContainerRequest, StartContainerRequest, WaitContainerRequest,
+    wait_container_output::Output,
 };
+use std::io::Write;
 use tokio_stream::StreamExt;
 
 #[allow(clippy::too_many_arguments)]
@@ -130,30 +132,61 @@ pub async fn run_container(
     let container_id = create_response.into_inner().id;
     eprintln!("Container created: {}", container_id);
 
-    eprintln!("Starting container...");
-    container_client
-        .start_container(StartContainerRequest {
-            container_id: container_id.clone(),
-            detach_keys: String::new(),
-        })
-        .await
-        .map_err(|e| format!("Failed to start container: {}", e))?;
-
     if detach {
+        // For detached mode, start the container and return immediately
+        eprintln!("Starting container...");
+        container_client
+            .start_container(StartContainerRequest {
+                container_id: container_id.clone(),
+                detach_keys: String::new(),
+            })
+            .await
+            .map_err(|e| format!("Failed to start container: {}", e))?;
+
         println!("{}", container_id);
         return Ok(());
     }
 
-    eprintln!("Waiting for container to exit...");
-    let wait_response = container_client
+    // For attached mode, use wait which starts and streams output
+    eprintln!("Starting and attaching to container...");
+    let mut wait_stream = container_client
         .wait(WaitContainerRequest {
             container_id: container_id.clone(),
             condition: String::new(),
         })
         .await
-        .map_err(|e| format!("Failed to wait for container: {}", e))?;
+        .map_err(|e| format!("Failed to start/wait for container: {}", e))?
+        .into_inner();
 
-    let exit_code = wait_response.into_inner().status_code;
+    let mut exit_code: i64 = 0;
+    
+    while let Some(output) = wait_stream.next().await {
+        match output {
+            Ok(msg) => match msg.output {
+                Some(Output::Data(data)) => {
+                    if data.stream == "stdout" {
+                        std::io::stdout().write_all(&data.data)?;
+                        std::io::stdout().flush()?;
+                    } else {
+                        std::io::stderr().write_all(&data.data)?;
+                        std::io::stderr().flush()?;
+                    }
+                }
+                Some(Output::Exit(result)) => {
+                    exit_code = result.status_code;
+                    if let Some(err) = result.error {
+                        eprintln!("Container error: {}", err.message);
+                    }
+                }
+                None => {}
+            },
+            Err(e) => {
+                eprintln!("Error reading container output: {}", e);
+                break;
+            }
+        }
+    }
+    
     eprintln!("Container exited with code: {}", exit_code);
 
     if rm {

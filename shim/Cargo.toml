@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+async-stream = "0.3"
+futures = "0.3"
 oci-spec = "0.7"
 ross-mount = { path = "../mount" }
 runc = { version = "0.3", features = ["async"] }

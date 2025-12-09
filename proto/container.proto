@@ -18,7 +18,7 @@ service ContainerService {
     rpc Exec (ExecRequest) returns (ExecResponse);
     rpc ExecStart (ExecStartRequest) returns (stream ExecOutput);
     rpc Attach (stream AttachRequest) returns (stream AttachOutput);
-    rpc Wait (WaitContainerRequest) returns (WaitContainerResponse);
+    rpc Wait (WaitContainerRequest) returns (stream WaitContainerOutput);
     rpc Kill (KillContainerRequest) returns (KillContainerResponse);
     rpc Rename (RenameContainerRequest) returns (RenameContainerResponse);
     rpc Stats (StatsRequest) returns (stream StatsResponse);
@@ -612,7 +612,19 @@ message WaitContainerRequest {
     string condition = 2;
 }
 
-message WaitContainerResponse {
+message WaitContainerOutput {
+    oneof output {
+        OutputData data = 1;
+        ExitResult exit = 2;
+    }
+}
+
+message OutputData {
+    string stream = 1;  // "stdout" or "stderr"
+    bytes data = 2;
+}
+
+message ExitResult {
     int64 status_code = 1;
     WaitError error = 2;
 }

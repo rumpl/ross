@@ -1,6 +1,6 @@
 use ross_container::{
     AttachInput, ContainerService, CreateContainerParams, ExecConfig, GetLogsParams,
-    ListContainersParams, StatsParams,
+    ListContainersParams, OutputEvent, StatsParams,
 };
 use ross_core::container_service_server::ContainerService as GrpcContainerService;
 use ross_core::{
@@ -12,7 +12,7 @@ use ross_core::{
     RenameContainerResponse, RestartContainerRequest, RestartContainerResponse,
     StartContainerRequest, StartContainerResponse, StatsRequest, StatsResponse,
     StopContainerRequest, StopContainerResponse, UnpauseContainerRequest, UnpauseContainerResponse,
-    WaitContainerRequest, WaitContainerResponse,
+    WaitContainerRequest, WaitContainerOutput,
 };
 use std::pin::Pin;
 use std::sync::Arc;
@@ -308,28 +308,53 @@ impl GrpcContainerService for ContainerServiceGrpc {
         Ok(Response::new(Box::pin(output)))
     }
 
+    type WaitStream = StreamResult<WaitContainerOutput>;
+
     async fn wait(
         &self,
         request: Request<WaitContainerRequest>,
-    ) -> Result<Response<WaitContainerResponse>, Status> {
+    ) -> Result<Response<Self::WaitStream>, Status> {
         let req = request.into_inner();
 
         if req.container_id.is_empty() {
             return Err(Status::invalid_argument("container_id is required"));
         }
 
-        let result = self
-            .service
-            .wait(&req.container_id, &req.condition)
-            .await
-            .map_err(into_status)?;
+        let stream = self.service.wait_streaming(&req.container_id);
+        let output = stream.map(|result| {
+            result
+                .map(|event| match event {
+                    OutputEvent::Stdout(data) => WaitContainerOutput {
+                        output: Some(ross_core::wait_container_output::Output::Data(
+                            ross_core::OutputData {
+                                stream: "stdout".to_string(),
+                                data,
+                            },
+                        )),
+                    },
+                    OutputEvent::Stderr(data) => WaitContainerOutput {
+                        output: Some(ross_core::wait_container_output::Output::Data(
+                            ross_core::OutputData {
+                                stream: "stderr".to_string(),
+                                data,
+                            },
+                        )),
+                    },
+                    OutputEvent::Exit(result) => WaitContainerOutput {
+                        output: Some(ross_core::wait_container_output::Output::Exit(
+                            ross_core::ExitResult {
+                                status_code: result.status_code,
+                                error: result
+                                    .error
+                                    .map(|msg| ross_core::WaitError { message: msg }),
+                            },
+                        )),
+                    },
+                })
+                .map_err(into_status)
+        });
 
-        Ok(Response::new(WaitContainerResponse {
-            status_code: result.status_code,
-            error: result
-                .error
-                .map(|msg| ross_core::WaitError { message: msg }),
-        }))
+        Ok(Response::new(Box::pin(output)))
     }
 
     async fn kill(

@@ -204,6 +204,13 @@ pub struct WaitResult {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub enum OutputEvent {
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+    Exit(WaitResult),
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct StatsParams {
     pub container_id: String,

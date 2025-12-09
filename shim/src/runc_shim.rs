@@ -1,11 +1,12 @@
 use crate::error::ShimError;
 use crate::types::*;
+use futures::Stream;
 use oci_spec::runtime::{
     LinuxBuilder, LinuxNamespace, LinuxNamespaceBuilder, LinuxNamespaceType, Mount, MountBuilder,
     ProcessBuilder, RootBuilder, Spec, SpecBuilder,
 };
 use ross_mount::MountSpec;
-use runc::options::{CreateOpts, DeleteOpts, GlobalOpts, KillOpts};
+use runc::options::{DeleteOpts, GlobalOpts, KillOpts};
 use runc::Runc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -104,6 +105,12 @@ impl RuncShim {
         tracing::debug!("OCI spec content: {}", &spec_content);
         fs::write(&spec_path, spec_content).await?;
 
+        // Create log files for stdout/stderr
+        let stdout_path = bundle_path.join("stdout.log");
+        let stderr_path = bundle_path.join("stderr.log");
+        fs::write(&stdout_path, "").await?;
+        fs::write(&stderr_path, "").await?;
+
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -129,42 +136,6 @@ impl RuncShim {
             host_config: opts.host_config,
         };
 
-        tracing::info!(container_id = %id, bundle = ?bundle_path, "Calling runc create");
-        
-        // Call runc directly
-        let runc_root = self.data_dir.join("runc");
-        let pid_file = bundle_path.join("container.pid");
-        
-        let mut child = tokio::process::Command::new("runc")
-            .arg("--root")
-            .arg(&runc_root)
-            .arg("create")
-            .arg("--bundle")
-            .arg(&bundle_path)
-            .arg("--pid-file")
-            .arg(&pid_file)
-            .arg("--no-pivot")
-            .arg(&id)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| ShimError::Runc(format!("Failed to spawn runc: {}", e)))?;
-        
-        tracing::info!(container_id = %id, "runc spawned, waiting for completion");
-        
-        // Use wait() instead of wait_with_output() because runc init inherits our pipes
-        // and keeps them open, which would cause wait_with_output() to block forever
-        let status = child.wait().await
-            .map_err(|e| ShimError::Runc(format!("Failed to wait for runc: {}", e)))?;
-        
-        if !status.success() {
-            tracing::error!(container_id = %id, status = ?status, "runc create failed");
-            return Err(ShimError::Runc(format!("runc create failed with status: {}", status)));
-        }
-        
-        tracing::info!(container_id = %id, "runc create completed successfully");
-
         self.save_container(&metadata).await?;
 
         {
@@ -172,7 +143,7 @@ impl RuncShim {
             containers.insert(id.clone(), metadata);
         }
 
-        tracing::info!(container_id = %id, "Container created");
+        tracing::info!(container_id = %id, "Container created (bundle prepared)");
         Ok(id)
     }
 
@@ -202,33 +173,81 @@ impl RuncShim {
     }
 
     pub async fn start(&self, id: &str) -> Result<(), ShimError> {
-        let mut containers = self.containers.write().await;
-        let metadata = containers
-            .get_mut(id)
-            .ok_or_else(|| ShimError::ContainerNotFound(id.to_string()))?;
+        let bundle_path: PathBuf;
+        {
+            let mut containers = self.containers.write().await;
+            let metadata = containers
+                .get_mut(id)
+                .ok_or_else(|| ShimError::ContainerNotFound(id.to_string()))?;
 
-        if metadata.info.state != ContainerState::Created {
-            return Err(ShimError::InvalidState {
-                expected: "created".to_string(),
-                actual: metadata.info.state.to_string(),
-            });
+            if metadata.info.state != ContainerState::Created {
+                return Err(ShimError::InvalidState {
+                    expected: "created".to_string(),
+                    actual: metadata.info.state.to_string(),
+                });
+            }
+
+            bundle_path = PathBuf::from(&metadata.info.bundle_path);
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+
+            metadata.info.state = ContainerState::Running;
+            metadata.info.started_at = Some(now);
+            self.save_container(metadata).await?;
         }
 
-        self.runc.start(id).await?;
+        // Use runc run with --detach to start the container in background
+        // Redirect stdout/stderr to log files
+        let runc_root = self.data_dir.join("runc");
+        let pid_file = bundle_path.join("container.pid");
+        let stdout_path = bundle_path.join("stdout.log");
+        let stderr_path = bundle_path.join("stderr.log");
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let stdout_file = std::fs::File::create(&stdout_path)
+            .map_err(|e| ShimError::Runc(format!("Failed to create stdout log: {}", e)))?;
+        let stderr_file = std::fs::File::create(&stderr_path)
+            .map_err(|e| ShimError::Runc(format!("Failed to create stderr log: {}", e)))?;
 
-        metadata.info.state = ContainerState::Running;
-        metadata.info.started_at = Some(now);
+        tracing::info!(container_id = %id, bundle = ?bundle_path, "Starting container with runc run");
 
-        if let Ok(state) = self.runc.state(id).await {
-            metadata.info.pid = Some(state.pid as u32);
+        let mut child = tokio::process::Command::new("runc")
+            .arg("--root")
+            .arg(&runc_root)
+            .arg("run")
+            .arg("--bundle")
+            .arg(&bundle_path)
+            .arg("--pid-file")
+            .arg(&pid_file)
+            .arg("--no-pivot")
+            .arg("--detach")
+            .arg(id)
+            .stdin(std::process::Stdio::null())
+            .stdout(stdout_file)
+            .stderr(stderr_file)
+            .spawn()
+            .map_err(|e| ShimError::Runc(format!("Failed to spawn runc: {}", e)))?;
+
+        let status = child.wait().await
+            .map_err(|e| ShimError::Runc(format!("Failed to wait for runc: {}", e)))?;
+
+        if !status.success() {
+            tracing::error!(container_id = %id, status = ?status, "runc run failed");
+            return Err(ShimError::Runc(format!("runc run failed with status: {}", status)));
         }
 
-        self.save_container(metadata).await?;
+        // Read PID from pid file
+        if let Ok(pid_str) = fs::read_to_string(&pid_file).await {
+            if let Ok(pid) = pid_str.trim().parse::<u32>() {
+                let mut containers = self.containers.write().await;
+                if let Some(metadata) = containers.get_mut(id) {
+                    metadata.info.pid = Some(pid);
+                    let _ = self.save_container(metadata).await;
+                }
+            }
+        }
 
         tracing::info!(container_id = %id, "Container started");
         Ok(())
@@ -300,8 +319,16 @@ impl RuncShim {
             rootfs_path = PathBuf::from(&metadata.info.rootfs_path);
         }
 
+        // Try to delete from runc, but ignore "container does not exist" errors
+        // This can happen when a container exits and runc auto-cleans it
         let delete_opts = DeleteOpts::new().force(force);
-        self.runc.delete(id, Some(&delete_opts)).await?;
+        if let Err(e) = self.runc.delete(id, Some(&delete_opts)).await {
+            let err_str = e.to_string();
+            if !err_str.contains("does not exist") {
+                return Err(e.into());
+            }
+            tracing::debug!(container_id = %id, "Container already removed from runc");
+        }
 
         // Unmount the rootfs
         if rootfs_path.exists() {
@@ -390,38 +417,20 @@ impl RuncShim {
                 .await
                 .map_err(|e| ShimError::Runc(format!("Failed to get runc state: {}", e)))?;
             
-            if !output.status.success() {
-                // Container doesn't exist anymore - it has exited and been cleaned up
-                // or there's an error. Try to get exit code from events or assume 0
-                tracing::info!(container_id = %id, "Container no longer exists in runc");
+            let container_gone = !output.status.success();
+            let is_stopped = if !container_gone {
+                let state_json: serde_json::Value = serde_json::from_slice(&output.stdout)
+                    .map_err(|e| ShimError::Runc(format!("Failed to parse runc state: {}", e)))?;
+                let status = state_json["status"].as_str().unwrap_or("");
+                tracing::debug!(container_id = %id, status = %status, "Container status");
+                status == "stopped"
+            } else {
+                true
+            };
+            
+            if container_gone || is_stopped {
+                tracing::info!(container_id = %id, "Container has stopped");
                 
-                // Update internal state
-                let mut containers = self.containers.write().await;
-                if let Some(metadata) = containers.get_mut(id) {
-                    let now = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs() as i64;
-                    metadata.info.state = ContainerState::Stopped;
-                    metadata.info.finished_at = Some(now);
-                    metadata.info.exit_code = Some(0); // TODO: get actual exit code
-                    let _ = self.save_container(metadata).await;
-                }
-                
-                return Ok(WaitResult {
-                    exit_code: 0,
-                    error: None,
-                });
-            }
-            
-            // Parse state JSON
-            let state_json: serde_json::Value = serde_json::from_slice(&output.stdout)
-                .map_err(|e| ShimError::Runc(format!("Failed to parse runc state: {}", e)))?;
-            
-            let status = state_json["status"].as_str().unwrap_or("");
-            tracing::debug!(container_id = %id, status = %status, "Container status");
-            
-            if status == "stopped" {
                 // Update internal state
                 let mut containers = self.containers.write().await;
                 if let Some(metadata) = containers.get_mut(id) {
@@ -442,6 +451,144 @@ impl RuncShim {
             }
 
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Run a container and stream its output. This is a combined start+wait operation
+    /// that captures stdout/stderr in real-time.
+    pub fn run_streaming(
+        &self,
+        id: String,
+    ) -> impl futures::Stream<Item = Result<OutputEvent, ShimError>> + Send + 'static {
+        let data_dir = self.data_dir.clone();
+        let containers = self.containers.clone();
+        
+        async_stream::try_stream! {
+            let bundle_path: PathBuf;
+            {
+                let mut containers_guard = containers.write().await;
+                let metadata = containers_guard
+                    .get_mut(&id)
+                    .ok_or_else(|| ShimError::ContainerNotFound(id.clone()))?;
+
+                if metadata.info.state != ContainerState::Created {
+                    Err(ShimError::InvalidState {
+                        expected: "created".to_string(),
+                        actual: metadata.info.state.to_string(),
+                    })?;
+                }
+
+                bundle_path = PathBuf::from(&metadata.info.bundle_path);
+
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64;
+
+                metadata.info.state = ContainerState::Running;
+                metadata.info.started_at = Some(now);
+                
+                let container_dir = data_dir.join("containers").join(&metadata.info.id);
+                fs::create_dir_all(&container_dir).await?;
+                let metadata_path = container_dir.join("metadata.json");
+                let content = serde_json::to_string_pretty(&metadata)?;
+                fs::write(&metadata_path, content).await?;
+            }
+
+            let runc_root = data_dir.join("runc");
+            let pid_file = bundle_path.join("container.pid");
+
+            tracing::info!(container_id = %id, bundle = ?bundle_path, "Starting container with runc run (streaming)");
+
+            let mut child = tokio::process::Command::new("runc")
+                .arg("--root")
+                .arg(&runc_root)
+                .arg("run")
+                .arg("--bundle")
+                .arg(&bundle_path)
+                .arg("--pid-file")
+                .arg(&pid_file)
+                .arg("--no-pivot")
+                .arg(&id)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| ShimError::Runc(format!("Failed to spawn runc: {}", e)))?;
+
+            let stdout = child.stdout.take()
+                .ok_or_else(|| ShimError::Runc("Failed to capture stdout".to_string()))?;
+            let stderr = child.stderr.take()
+                .ok_or_else(|| ShimError::Runc("Failed to capture stderr".to_string()))?;
+
+            let mut stdout_reader = tokio::io::BufReader::new(stdout);
+            let mut stderr_reader = tokio::io::BufReader::new(stderr);
+            
+            let mut stdout_buf = vec![0u8; 4096];
+            let mut stderr_buf = vec![0u8; 4096];
+
+            loop {
+                tokio::select! {
+                    result = tokio::io::AsyncReadExt::read(&mut stdout_reader, &mut stdout_buf) => {
+                        match result {
+                            Ok(0) => {}, // EOF on stdout
+                            Ok(n) => {
+                                yield OutputEvent::Stdout(stdout_buf[..n].to_vec());
+                            }
+                            Err(e) => {
+                                tracing::warn!("Error reading stdout: {}", e);
+                            }
+                        }
+                    }
+                    result = tokio::io::AsyncReadExt::read(&mut stderr_reader, &mut stderr_buf) => {
+                        match result {
+                            Ok(0) => {}, // EOF on stderr
+                            Ok(n) => {
+                                yield OutputEvent::Stderr(stderr_buf[..n].to_vec());
+                            }
+                            Err(e) => {
+                                tracing::warn!("Error reading stderr: {}", e);
+                            }
+                        }
+                    }
+                    status = child.wait() => {
+                        let exit_code = match status {
+                            Ok(s) => s.code().unwrap_or(-1),
+                            Err(e) => {
+                                tracing::error!("Error waiting for child: {}", e);
+                                -1
+                            }
+                        };
+
+                        // Update internal state
+                        let mut containers_guard = containers.write().await;
+                        if let Some(metadata) = containers_guard.get_mut(&id) {
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs() as i64;
+                            metadata.info.state = ContainerState::Stopped;
+                            metadata.info.finished_at = Some(now);
+                            metadata.info.exit_code = Some(exit_code);
+                            
+                            let container_dir = data_dir.join("containers").join(&metadata.info.id);
+                            let metadata_path = container_dir.join("metadata.json");
+                            if let Ok(content) = serde_json::to_string_pretty(&metadata) {
+                                let _ = fs::write(&metadata_path, content).await;
+                            }
+                        }
+
+                        tracing::info!(container_id = %id, exit_code = exit_code, "Container exited");
+                        
+                        yield OutputEvent::Exit(WaitResult {
+                            exit_code,
+                            error: None,
+                        });
+                        
+                        break;
+                    }
+                }
+            }
         }
     }
 

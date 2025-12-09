@@ -6,6 +6,7 @@ use ross_core::ross::{
     ListContainersRequest, PauseContainerRequest, PortBinding, RemoveContainerRequest,
     RenameContainerRequest, RestartContainerRequest, StartContainerRequest, StatsRequest,
     StopContainerRequest, UnpauseContainerRequest, WaitContainerRequest,
+    wait_container_output::Output,
 };
 use tokio_stream::StreamExt;
 
@@ -709,21 +710,43 @@ async fn container_wait(
     client: &mut ContainerServiceClient<tonic::transport::Channel>,
     container_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let response = client
+    let mut stream = client
         .wait(WaitContainerRequest {
             container_id: container_id.to_string(),
             condition: String::new(),
         })
         .await
-        .map_err(|e| format!("Failed to wait for container: {}", e))?;
+        .map_err(|e| format!("Failed to wait for container: {}", e))?
+        .into_inner();
 
-    let result = response.into_inner();
-    println!("{}", result.status_code);
-
-    if let Some(err) = result.error
-        && !err.message.is_empty()
-    {
-        eprintln!("Error: {}", err.message);
+    while let Some(output) = stream.next().await {
+        match output {
+            Ok(msg) => match msg.output {
+                Some(Output::Data(data)) => {
+                    use std::io::Write;
+                    if data.stream == "stdout" {
+                        std::io::stdout().write_all(&data.data)?;
+                        std::io::stdout().flush()?;
+                    } else {
+                        std::io::stderr().write_all(&data.data)?;
+                        std::io::stderr().flush()?;
+                    }
+                }
+                Some(Output::Exit(result)) => {
+                    println!("{}", result.status_code);
+                    if let Some(err) = result.error {
+                        if !err.message.is_empty() {
+                            eprintln!("Error: {}", err.message);
+                        }
+                    }
+                }
+                None => {}
+            },
+            Err(e) => {
+                eprintln!("Stream error: {}", e);
+                break;
+            }
+        }
     }
 
     Ok(())

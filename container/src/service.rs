@@ -533,18 +533,27 @@ impl ContainerService {
         Box::pin(output)
     }
 
-    pub async fn wait(
+    pub fn wait_streaming(
         &self,
         container_id: &str,
-        _condition: &str,
-    ) -> Result<WaitResult, ContainerError> {
-        tracing::info!("Waiting for container: {}", container_id);
+    ) -> impl futures::Stream<Item = Result<OutputEvent, ContainerError>> + Send + 'static {
+        use futures::StreamExt;
+        
+        tracing::info!("Waiting for container (streaming): {}", container_id);
 
-        let result = self.shim.wait(container_id).await?;
-
-        Ok(WaitResult {
-            status_code: result.exit_code as i64,
-            error: result.error,
+        let stream = self.shim.run_streaming(container_id.to_string());
+        
+        stream.map(|result| {
+            result
+                .map(|event| match event {
+                    ross_shim::OutputEvent::Stdout(data) => OutputEvent::Stdout(data),
+                    ross_shim::OutputEvent::Stderr(data) => OutputEvent::Stderr(data),
+                    ross_shim::OutputEvent::Exit(r) => OutputEvent::Exit(WaitResult {
+                        status_code: r.exit_code as i64,
+                        error: r.error,
+                    }),
+                })
+                .map_err(ContainerError::from)
         })
     }
 
