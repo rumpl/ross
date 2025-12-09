@@ -33,6 +33,10 @@ enum Commands {
         /// Data directory for storing images
         #[arg(long, default_value = "/tmp/ross")]
         data_dir: PathBuf,
+
+        /// Maximum number of parallel blob downloads
+        #[arg(long, default_value_t = 3)]
+        max_concurrent_downloads: usize,
     },
 }
 
@@ -47,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             host,
             port,
             data_dir,
+            max_concurrent_downloads,
         } => {
             let addr = format!("{}:{}", host, port).parse()?;
 
@@ -55,12 +60,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let store = FileSystemStore::new(&store_path).await?;
             let store = Arc::new(store);
 
-            tracing::info!("Starting Ross daemon gRPC server on {}", addr);
+            tracing::info!(
+                "Starting Ross daemon gRPC server on {} (max concurrent downloads: {})",
+                addr,
+                max_concurrent_downloads
+            );
 
             Server::builder()
                 .add_service(RossServer::new(RossService))
                 .add_service(ImageServiceServer::new(ImageServiceImpl::new(
                     store.clone(),
+                    max_concurrent_downloads,
                 )))
                 .add_service(ContainerServiceServer::new(ContainerServiceImpl))
                 .serve(addr)

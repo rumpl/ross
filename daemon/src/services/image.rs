@@ -6,28 +6,107 @@ use ross_core::{
     PushImageRequest, RemoveImageRequest, RemoveImageResponse, SearchImagesRequest,
     SearchImagesResponse, TagImageRequest, TagImageResponse,
 };
-use ross_remote::{ImageReference, RegistryClient};
+use ross_remote::{Descriptor, ImageReference, RegistryClient};
 use ross_store::FileSystemStore;
 use std::pin::Pin;
 use std::sync::Arc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 type StreamResult<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
-#[allow(dead_code)]
 pub struct ImageServiceImpl {
     store: Arc<FileSystemStore>,
-    registry: RegistryClient,
+    max_concurrent_downloads: usize,
 }
 
 impl ImageServiceImpl {
-    pub fn new(store: Arc<FileSystemStore>) -> Self {
+    pub fn new(store: Arc<FileSystemStore>, max_concurrent_downloads: usize) -> Self {
         Self {
             store,
-            registry: RegistryClient::new().expect("failed to create registry client"),
+            max_concurrent_downloads,
         }
     }
+}
+
+#[derive(Debug)]
+enum LayerEvent {
+    Downloading { id: String, index: usize, total: usize },
+    Downloaded { id: String },
+    Stored { id: String },
+    Exists { id: String },
+    Error { id: String, error: String },
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn download_layer(
+    registry: Arc<RegistryClient>,
+    store: Arc<FileSystemStore>,
+    reference: ImageReference,
+    layer: Descriptor,
+    index: usize,
+    total: usize,
+    semaphore: Arc<Semaphore>,
+    tx: mpsc::Sender<LayerEvent>,
+) {
+    let layer_digest = layer.digest.clone();
+    let short_layer_id = if layer_digest.len() > 19 {
+        layer_digest[7..19].to_string()
+    } else {
+        layer_digest.clone()
+    };
+
+    let store_digest = ross_store::Digest {
+        algorithm: "sha256".to_string(),
+        hash: layer_digest.trim_start_matches("sha256:").to_string(),
+    };
+
+    if let Ok(Some(_)) = store.stat_blob(&store_digest).await {
+        let _ = tx.send(LayerEvent::Exists { id: short_layer_id }).await;
+        return;
+    }
+
+    let _permit = semaphore.acquire().await.expect("semaphore closed");
+
+    let _ = tx
+        .send(LayerEvent::Downloading {
+            id: short_layer_id.clone(),
+            index,
+            total,
+        })
+        .await;
+
+    let layer_bytes = match registry.get_blob_bytes(&reference, &layer_digest).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let _ = tx
+                .send(LayerEvent::Error {
+                    id: short_layer_id,
+                    error: format!("Failed to download layer: {}", e),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let _ = tx
+        .send(LayerEvent::Downloaded {
+            id: short_layer_id.clone(),
+        })
+        .await;
+
+    if let Err(e) = store.put_blob(&layer.media_type, &layer_bytes, None).await {
+        let _ = tx
+            .send(LayerEvent::Error {
+                id: short_layer_id,
+                error: format!("Failed to store layer: {}", e),
+            })
+            .await;
+        return;
+    }
+
+    let _ = tx.send(LayerEvent::Stored { id: short_layer_id }).await;
 }
 
 #[tonic::async_trait]
@@ -38,7 +117,95 @@ impl ImageService for ImageServiceImpl {
     ) -> Result<Response<ListImagesResponse>, Status> {
         let req = request.into_inner();
         tracing::info!("Listing images with filters: {:?}", req.filters);
-        Ok(Response::new(ListImagesResponse { images: vec![] }))
+
+        let repositories = self
+            .store
+            .list_repositories()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let mut images = Vec::new();
+
+        for repo in repositories {
+            let tags = self
+                .store
+                .list_tags(&repo)
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?;
+
+            for tag_info in tags {
+                let digest = match &tag_info.digest {
+                    Some(d) => d,
+                    None => continue,
+                };
+
+                let (manifest_bytes, _media_type) = match self.store.get_manifest(digest).await {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+
+                let manifest: ross_remote::ManifestV2 = match serde_json::from_slice(&manifest_bytes)
+                {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+
+                let config_digest = ross_store::Digest {
+                    algorithm: "sha256".to_string(),
+                    hash: manifest.config.digest.trim_start_matches("sha256:").to_string(),
+                };
+
+                let config_bytes = match self.store.get_blob(&config_digest, 0, -1).await {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+
+                let config: ross_remote::ImageConfig = match serde_json::from_slice(&config_bytes) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+
+                let total_size: i64 = manifest.layers.iter().map(|l| l.size).sum();
+
+                let repo_tag = format!("{}:{}", repo, tag_info.tag);
+                let repo_digest = format!("{}@sha256:{}", repo, digest.hash);
+
+                let labels = config
+                    .config
+                    .as_ref()
+                    .map(|c| c.labels.clone())
+                    .unwrap_or_default();
+
+                let layer_digests: Vec<String> = manifest
+                    .layers
+                    .iter()
+                    .map(|l| l.digest.clone())
+                    .collect();
+
+                images.push(Image {
+                    id: format!("sha256:{}", digest.hash),
+                    repo_tags: vec![repo_tag],
+                    repo_digests: vec![repo_digest],
+                    parent: String::new(),
+                    comment: String::new(),
+                    created: None,
+                    container: String::new(),
+                    docker_version: String::new(),
+                    author: String::new(),
+                    architecture: config.architecture.clone(),
+                    os: config.os.clone(),
+                    size: total_size,
+                    virtual_size: total_size,
+                    labels,
+                    root_fs: Some(ross_core::RootFs {
+                        r#type: "layers".to_string(),
+                        layers: layer_digests,
+                    }),
+                });
+            }
+        }
+
+        Ok(Response::new(ListImagesResponse { images }))
     }
 
     async fn inspect_image(
@@ -74,8 +241,7 @@ impl ImageService for ImageServiceImpl {
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
         let store = self.store.clone();
-        let registry = RegistryClient::new()
-            .map_err(|e| Status::internal(e.to_string()))?;
+        let max_concurrent = self.max_concurrent_downloads;
 
         let output = stream! {
             yield Ok(PullImageProgress {
@@ -86,7 +252,20 @@ impl ImageService for ImageServiceImpl {
                 error: String::new(),
             });
 
-            // Container images are built for linux, not the host OS
+            let registry = match RegistryClient::new() {
+                Ok(r) => Arc::new(r),
+                Err(e) => {
+                    yield Ok(PullImageProgress {
+                        id: reference.full_name(),
+                        status: String::new(),
+                        progress: String::new(),
+                        progress_detail: None,
+                        error: format!("Failed to create registry client: {}", e),
+                    });
+                    return;
+                }
+            };
+
             let os = "linux";
             let arch = match std::env::consts::ARCH {
                 "x86_64" => "amd64",
@@ -167,81 +346,85 @@ impl ImageService for ImageServiceImpl {
                 error: String::new(),
             });
 
+            let semaphore = Arc::new(Semaphore::new(max_concurrent));
+            let (tx, mut rx) = mpsc::channel::<LayerEvent>(manifest.layers.len() * 4);
+            let total_layers = manifest.layers.len();
+
+            let mut handles = Vec::new();
             for (i, layer) in manifest.layers.iter().enumerate() {
-                let layer_digest = &layer.digest;
-                let short_layer_id = if layer_digest.len() > 19 {
-                    &layer_digest[7..19]
-                } else {
-                    layer_digest
-                };
+                let handle = tokio::spawn(download_layer(
+                    registry.clone(),
+                    store.clone(),
+                    reference.clone(),
+                    layer.clone(),
+                    i + 1,
+                    total_layers,
+                    semaphore.clone(),
+                    tx.clone(),
+                ));
+                handles.push(handle);
+            }
 
-                let store_digest = ross_store::Digest {
-                    algorithm: "sha256".to_string(),
-                    hash: layer_digest.trim_start_matches("sha256:").to_string(),
-                };
+            drop(tx);
 
-                if let Ok(Some(_)) = store.stat_blob(&store_digest).await {
-                    yield Ok(PullImageProgress {
-                        id: short_layer_id.to_string(),
-                        status: "Already exists".to_string(),
-                        progress: String::new(),
-                        progress_detail: None,
-                        error: String::new(),
-                    });
-                    continue;
-                }
-
-                yield Ok(PullImageProgress {
-                    id: short_layer_id.to_string(),
-                    status: "Downloading".to_string(),
-                    progress: format!("[{}/{}]", i + 1, manifest.layers.len()),
-                    progress_detail: Some(ross_core::ProgressDetail {
-                        current: 0,
-                        total: layer.size,
-                    }),
-                    error: String::new(),
-                });
-
-                let layer_bytes = match registry.get_blob_bytes(&reference, layer_digest).await {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
+            let mut error_occurred = false;
+            while let Some(event) = rx.recv().await {
+                match event {
+                    LayerEvent::Exists { id } => {
                         yield Ok(PullImageProgress {
-                            id: short_layer_id.to_string(),
+                            id,
+                            status: "Already exists".to_string(),
+                            progress: String::new(),
+                            progress_detail: None,
+                            error: String::new(),
+                        });
+                    }
+                    LayerEvent::Downloading { id, index, total } => {
+                        yield Ok(PullImageProgress {
+                            id,
+                            status: "Downloading".to_string(),
+                            progress: format!("[{}/{}]", index, total),
+                            progress_detail: None,
+                            error: String::new(),
+                        });
+                    }
+                    LayerEvent::Downloaded { id } => {
+                        yield Ok(PullImageProgress {
+                            id,
+                            status: "Download complete".to_string(),
+                            progress: String::new(),
+                            progress_detail: None,
+                            error: String::new(),
+                        });
+                    }
+                    LayerEvent::Stored { id } => {
+                        yield Ok(PullImageProgress {
+                            id,
+                            status: "Pull complete".to_string(),
+                            progress: String::new(),
+                            progress_detail: None,
+                            error: String::new(),
+                        });
+                    }
+                    LayerEvent::Error { id, error } => {
+                        error_occurred = true;
+                        yield Ok(PullImageProgress {
+                            id,
                             status: String::new(),
                             progress: String::new(),
                             progress_detail: None,
-                            error: format!("Failed to download layer: {}", e),
+                            error,
                         });
-                        return;
                     }
-                };
-
-                yield Ok(PullImageProgress {
-                    id: short_layer_id.to_string(),
-                    status: "Download complete".to_string(),
-                    progress: String::new(),
-                    progress_detail: None,
-                    error: String::new(),
-                });
-
-                if let Err(e) = store.put_blob(&layer.media_type, &layer_bytes, None).await {
-                    yield Ok(PullImageProgress {
-                        id: short_layer_id.to_string(),
-                        status: String::new(),
-                        progress: String::new(),
-                        progress_detail: None,
-                        error: format!("Failed to store layer: {}", e),
-                    });
-                    return;
                 }
+            }
 
-                yield Ok(PullImageProgress {
-                    id: short_layer_id.to_string(),
-                    status: "Pull complete".to_string(),
-                    progress: String::new(),
-                    progress_detail: None,
-                    error: String::new(),
-                });
+            for handle in handles {
+                let _ = handle.await;
+            }
+
+            if error_occurred {
+                return;
             }
 
             let manifest_bytes = serde_json::to_vec(&manifest).unwrap_or_default();

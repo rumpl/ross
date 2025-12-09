@@ -623,6 +623,43 @@ impl FileSystemStore {
         Ok((blobs_removed, manifests_removed, bytes_freed, removed_digests))
     }
 
+    pub async fn list_repositories(&self) -> Result<Vec<String>, StoreError> {
+        let tags_dir = self.root.join(TAGS_DIR);
+        let mut repositories = Vec::new();
+
+        if !tags_dir.exists() {
+            return Ok(repositories);
+        }
+
+        async fn collect_repos(
+            dir: &Path,
+            prefix: &str,
+            repos: &mut Vec<String>,
+        ) -> Result<(), StoreError> {
+            let mut entries = fs::read_dir(dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let path = entry.path();
+
+                if entry.file_type().await?.is_dir() {
+                    let new_prefix = if prefix.is_empty() {
+                        name
+                    } else {
+                        format!("{}/{}", prefix, name)
+                    };
+                    Box::pin(collect_repos(&path, &new_prefix, repos)).await?;
+                } else if entry.file_type().await?.is_file() && !repos.contains(&prefix.to_string())
+                {
+                    repos.push(prefix.to_string());
+                }
+            }
+            Ok(())
+        }
+
+        collect_repos(&tags_dir, "", &mut repositories).await?;
+        Ok(repositories)
+    }
+
     pub async fn get_store_info(&self) -> Result<(i64, i64, i64, i64), StoreError> {
         let blobs = self.list_blobs(None).await?;
         let manifests = self.list_manifests(None).await?;

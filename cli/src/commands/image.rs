@@ -1,9 +1,11 @@
 use clap::Subcommand;
 use ross_core::ross::image_service_client::ImageServiceClient;
 use ross_core::ross::{
-    BuildImageRequest, InspectImageRequest, ListImagesRequest, PullImageRequest, PushImageRequest,
-    RemoveImageRequest, SearchImagesRequest, TagImageRequest,
+    BuildImageRequest, InspectImageRequest, ListImagesRequest, PullImageProgress,
+    PullImageRequest, PushImageRequest, RemoveImageRequest, SearchImagesRequest, TagImageRequest,
 };
+use std::collections::HashMap;
+use std::io::{self, IsTerminal, Write};
 use tokio_stream::StreamExt;
 
 use crate::utils::format_size;
@@ -183,11 +185,8 @@ async fn image_list(
     }
 
     for image in images {
-        let id = if image.id.len() > 12 {
-            &image.id[..12]
-        } else {
-            &image.id
-        };
+        let id = image.id.trim_start_matches("sha256:");
+        let id_short = if id.len() > 12 { &id[..12] } else { id };
         let size = format_size(image.size as u64);
 
         if image.repo_tags.is_empty() {
@@ -195,10 +194,10 @@ async fn image_list(
                 let digest = image.repo_digests.first().map(|d| d.as_str()).unwrap_or("");
                 println!(
                     "{:<20} {:<15} {:<72} {:<15} {:<10}",
-                    "<none>", "<none>", digest, id, size
+                    "<none>", "<none>", digest, id_short, size
                 );
             } else {
-                println!("{:<40} {:<15} {:<15} {:<10}", "<none>", "<none>", id, size);
+                println!("{:<40} {:<15} {:<15} {:<10}", "<none>", "<none>", id_short, size);
             }
         } else {
             for repo_tag in &image.repo_tags {
@@ -213,10 +212,10 @@ async fn image_list(
                     let digest = image.repo_digests.first().map(|d| d.as_str()).unwrap_or("");
                     println!(
                         "{:<20} {:<15} {:<72} {:<15} {:<10}",
-                        repo, tag, digest, id, size
+                        repo, tag, digest, id_short, size
                     );
                 } else {
-                    println!("{:<40} {:<15} {:<15} {:<10}", repo, tag, id, size);
+                    println!("{:<40} {:<15} {:<15} {:<10}", repo, tag, id_short, size);
                 }
             }
         }
@@ -281,6 +280,156 @@ async fn image_inspect(
     Ok(())
 }
 
+struct PullProgressDisplay {
+    layers: HashMap<String, LayerState>,
+    layer_order: Vec<String>,
+    footer_lines: Vec<String>,
+    is_tty: bool,
+    lines_printed: usize,
+}
+
+#[derive(Clone)]
+struct LayerState {
+    status: String,
+    progress: String,
+    done: bool,
+}
+
+impl PullProgressDisplay {
+    fn new() -> Self {
+        Self {
+            layers: HashMap::new(),
+            layer_order: Vec::new(),
+            footer_lines: Vec::new(),
+            is_tty: std::io::stdout().is_terminal(),
+            lines_printed: 0,
+        }
+    }
+
+    fn update(&mut self, progress: &PullImageProgress) {
+        let id = &progress.id;
+
+        if progress.status.starts_with("Resolving")
+            || progress.status.starts_with("Resolved")
+        {
+            if self.is_tty {
+                self.clear_lines();
+                println!("{}: {}", id, progress.status);
+                self.lines_printed = 0;
+                self.redraw_all();
+            } else {
+                println!("{}: {}", id, progress.status);
+            }
+            return;
+        }
+
+        if progress.status.starts_with("Digest:") || progress.status.starts_with("Status:") {
+            self.footer_lines.push(format!("{}: {}", id, progress.status));
+            if self.is_tty {
+                self.clear_lines();
+                self.redraw_all();
+            } else {
+                println!("{}: {}", id, progress.status);
+            }
+            return;
+        }
+
+        if !self.layers.contains_key(id) {
+            self.layer_order.push(id.clone());
+            self.layers.insert(
+                id.clone(),
+                LayerState {
+                    status: String::new(),
+                    progress: String::new(),
+                    done: false,
+                },
+            );
+        }
+
+        let done = progress.status == "Pull complete"
+            || progress.status == "Already exists"
+            || !progress.error.is_empty();
+
+        let is_final_state = done
+            || progress.status == "Downloading"
+            || progress.status == "Pulling config";
+
+        if let Some(state) = self.layers.get_mut(id) {
+            state.status = if !progress.error.is_empty() {
+                format!("Error: {}", progress.error)
+            } else {
+                progress.status.clone()
+            };
+            state.progress = progress.progress.clone();
+            state.done = done;
+        }
+
+        if self.is_tty {
+            self.clear_lines();
+            self.redraw_all();
+        } else if is_final_state
+            && let Some(state) = self.layers.get(id)
+        {
+            println!("{}: {}", id, state.status);
+        }
+    }
+
+    fn clear_lines(&self) {
+        if self.lines_printed > 0 {
+            print!("\x1b[{}A", self.lines_printed);
+            for _ in 0..self.lines_printed {
+                println!("\x1b[2K");
+            }
+            print!("\x1b[{}A", self.lines_printed);
+        }
+    }
+
+    fn redraw_all(&mut self) {
+        let mut stdout = io::stdout();
+        let mut count = 0;
+
+        for id in &self.layer_order {
+            if let Some(state) = self.layers.get(id) {
+                let status_icon = if state.done {
+                    if state.status.starts_with("Error") {
+                        "\x1b[31m✗\x1b[0m"
+                    } else if state.status == "Already exists" {
+                        "\x1b[33m≡\x1b[0m"
+                    } else {
+                        "\x1b[32m✓\x1b[0m"
+                    }
+                } else {
+                    "\x1b[34m⠿\x1b[0m"
+                };
+
+                let line = if !state.progress.is_empty() {
+                    format!("{} {}: {} {}", status_icon, id, state.status, state.progress)
+                } else {
+                    format!("{} {}: {}", status_icon, id, state.status)
+                };
+
+                println!("{}", line);
+                count += 1;
+            }
+        }
+
+        for line in &self.footer_lines {
+            println!("{}", line);
+            count += 1;
+        }
+
+        self.lines_printed = count;
+        let _ = stdout.flush();
+    }
+
+    fn finish(&self) {
+        if self.is_tty {
+            let mut stdout = io::stdout();
+            let _ = stdout.flush();
+        }
+    }
+}
+
 async fn image_pull(
     client: &mut ImageServiceClient<tonic::transport::Channel>,
     image_name: &str,
@@ -298,23 +447,21 @@ async fn image_pull(
         .map_err(|e| format!("Failed to pull image: {}", e))?
         .into_inner();
 
+    let mut display = PullProgressDisplay::new();
+
     while let Some(progress) = stream.next().await {
         match progress {
             Ok(p) => {
-                if !p.error.is_empty() {
-                    eprintln!("Error: {}", p.error);
-                } else if !p.progress.is_empty() {
-                    println!("{}: {} {}", p.id, p.status, p.progress);
-                } else {
-                    println!("{}: {}", p.id, p.status);
-                }
+                display.update(&p);
             }
             Err(e) => {
-                eprintln!("Stream error: {}", e);
+                eprintln!("\nStream error: {}", e);
                 break;
             }
         }
     }
+
+    display.finish();
 
     Ok(())
 }
