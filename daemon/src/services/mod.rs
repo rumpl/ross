@@ -2,6 +2,6 @@ mod container;
 mod image;
 mod ross;
 
-pub use container::ContainerServiceImpl;
-pub use image::ImageServiceImpl;
+pub use container::ContainerServiceGrpc;
+pub use image::ImageServiceGrpc;
 pub use ross::RossService;

@@ -90,6 +90,8 @@ agents:
       </rust_developer>
     add_date: true
     add_environment_info: true
+    add_prompt_files:
+      - AGENTS.md
     toolsets:
       - type: filesystem
       - type: shell

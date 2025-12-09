@@ -1,42 +1,63 @@
-use async_stream::stream;
-use prost_types::Timestamp;
-use ross_core::container_service_server::ContainerService;
+use ross_container::{
+    AttachInput, ContainerService, CreateContainerParams, ExecConfig, GetLogsParams,
+    ListContainersParams, StatsParams,
+};
+use ross_core::container_service_server::ContainerService as GrpcContainerService;
 use ross_core::{
-    AttachOutput, AttachRequest, CpuStats, CpuUsage, CreateContainerRequest,
-    CreateContainerResponse, ExecOutput, ExecRequest, ExecResponse, ExecStartRequest,
-    GetLogsRequest, InspectContainerRequest, InspectContainerResponse, KillContainerRequest,
-    KillContainerResponse, ListContainersRequest, ListContainersResponse, LogEntry, MemoryStats,
-    PauseContainerRequest, PauseContainerResponse, RemoveContainerRequest, RemoveContainerResponse,
-    RenameContainerRequest, RenameContainerResponse, RestartContainerRequest,
-    RestartContainerResponse, StartContainerRequest, StartContainerResponse, StatsRequest,
-    StatsResponse, StopContainerRequest, StopContainerResponse, UnpauseContainerRequest,
-    UnpauseContainerResponse, WaitContainerRequest, WaitContainerResponse,
+    AttachOutput, AttachRequest, CreateContainerRequest, CreateContainerResponse, ExecOutput,
+    ExecRequest, ExecResponse, ExecStartRequest, GetLogsRequest, InspectContainerRequest,
+    InspectContainerResponse, KillContainerRequest, KillContainerResponse, ListContainersRequest,
+    ListContainersResponse, LogEntry, PauseContainerRequest, PauseContainerResponse,
+    RemoveContainerRequest, RemoveContainerResponse, RenameContainerRequest,
+    RenameContainerResponse, RestartContainerRequest, RestartContainerResponse,
+    StartContainerRequest, StartContainerResponse, StatsRequest, StatsResponse,
+    StopContainerRequest, StopContainerResponse, UnpauseContainerRequest, UnpauseContainerResponse,
+    WaitContainerRequest, WaitContainerResponse,
 };
 use std::pin::Pin;
-use std::time::SystemTime;
+use std::sync::Arc;
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 
 type StreamResult<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send>>;
 
-fn now_timestamp() -> Option<Timestamp> {
-    Some(Timestamp::from(SystemTime::now()))
+pub struct ContainerServiceGrpc {
+    service: Arc<ContainerService>,
 }
 
-#[derive(Default)]
-pub struct ContainerServiceImpl;
+impl ContainerServiceGrpc {
+    pub fn new(service: Arc<ContainerService>) -> Self {
+        Self { service }
+    }
+}
 
 #[tonic::async_trait]
-impl ContainerService for ContainerServiceImpl {
+impl GrpcContainerService for ContainerServiceGrpc {
     async fn create_container(
         &self,
         request: Request<CreateContainerRequest>,
     ) -> Result<Response<CreateContainerResponse>, Status> {
         let req = request.into_inner();
-        tracing::info!("Creating container with name: {:?}", req.name);
+
+        let params = CreateContainerParams {
+            name: if req.name.is_empty() {
+                None
+            } else {
+                Some(req.name)
+            },
+            config: req.config.map(container_config_from_grpc).unwrap_or_default(),
+            host_config: req.host_config.map(host_config_from_grpc).unwrap_or_default(),
+            networking_config: req
+                .networking_config
+                .map(networking_config_from_grpc)
+                .unwrap_or_default(),
+        };
+
+        let result = self.service.create(params).await.map_err(into_status)?;
+
         Ok(Response::new(CreateContainerResponse {
-            id: "stub-container-id".to_string(),
-            warnings: vec![],
+            id: result.id,
+            warnings: result.warnings,
         }))
     }
 
@@ -45,7 +66,16 @@ impl ContainerService for ContainerServiceImpl {
         request: Request<StartContainerRequest>,
     ) -> Result<Response<StartContainerResponse>, Status> {
         let req = request.into_inner();
-        tracing::info!("Starting container: {}", req.container_id);
+
+        if req.container_id.is_empty() {
+            return Err(Status::invalid_argument("container_id is required"));
+        }
+
+        self.service
+            .start(&req.container_id)
+            .await
+            .map_err(into_status)?;
+
         Ok(Response::new(StartContainerResponse {}))
     }
 
@@ -54,11 +84,16 @@ impl ContainerService for ContainerServiceImpl {
         request: Request<StopContainerRequest>,
     ) -> Result<Response<StopContainerResponse>, Status> {
         let req = request.into_inner();
-        tracing::info!(
-            "Stopping container: {} with timeout: {}",
-            req.container_id,
-            req.timeout
-        );
+
+        if req.container_id.is_empty() {
+            return Err(Status::invalid_argument("container_id is required"));
+        }
+
+        self.service
+            .stop(&req.container_id, req.timeout)
+            .await
+            .map_err(into_status)?;
+
         Ok(Response::new(StopContainerResponse {}))
     }
 
@@ -67,11 +102,16 @@ impl ContainerService for ContainerServiceImpl {
         request: Request<RestartContainerRequest>,
     ) -> Result<Response<RestartContainerResponse>, Status> {
         let req = request.into_inner();
-        tracing::info!(
-            "Restarting container: {} with timeout: {}",
-            req.container_id,
-            req.timeout
-        );
+
+        if req.container_id.is_empty() {
+            return Err(Status::invalid_argument("container_id is required"));
+        }
+
+        self.service
+            .restart(&req.container_id, req.timeout)
+            .await
+            .map_err(into_status)?;
+
         Ok(Response::new(RestartContainerResponse {}))
     }
 
@@ -80,12 +120,19 @@ impl ContainerService for ContainerServiceImpl {
         request: Request<ListContainersRequest>,
     ) -> Result<Response<ListContainersResponse>, Status> {
         let req = request.into_inner();
-        tracing::info!(
-            "Listing containers (all: {}, limit: {})",
-            req.all,
-            req.limit
-        );
-        Ok(Response::new(ListContainersResponse { containers: vec![] }))
+
+        let params = ListContainersParams {
+            all: req.all,
+            limit: req.limit,
+            size: req.size,
+            filters: req.filters,
+        };
+
+        let containers = self.service.list(params).await.map_err(into_status)?;
+
+        Ok(Response::new(ListContainersResponse {
+            containers: containers.into_iter().map(container_to_grpc).collect(),
+        }))
     }
 
     async fn inspect_container(
@@ -93,29 +140,18 @@ impl ContainerService for ContainerServiceImpl {
         request: Request<InspectContainerRequest>,
     ) -> Result<Response<InspectContainerResponse>, Status> {
         let req = request.into_inner();
-        tracing::info!("Inspecting container: {}", req.container_id);
-        Ok(Response::new(InspectContainerResponse {
-            container: None,
-            state: None,
-            path: String::new(),
-            args: vec![],
-            resolv_conf_path: String::new(),
-            hostname_path: String::new(),
-            hosts_path: String::new(),
-            log_path: String::new(),
-            name: String::new(),
-            restart_count: 0,
-            driver: String::new(),
-            platform: String::new(),
-            mount_label: String::new(),
-            process_label: String::new(),
-            app_armor_profile: String::new(),
-            exec_ids: vec![],
-            config: None,
-            host_config: None,
-            graph_driver: None,
-            network_settings: None,
-        }))
+
+        if req.container_id.is_empty() {
+            return Err(Status::invalid_argument("container_id is required"));
+        }
+
+        let inspection = self
+            .service
+            .inspect(&req.container_id)
+            .await
+            .map_err(into_status)?;
+
+        Ok(Response::new(inspection_to_grpc(inspection)))
     }
 
     async fn remove_container(
@@ -123,12 +159,16 @@ impl ContainerService for ContainerServiceImpl {
         request: Request<RemoveContainerRequest>,
     ) -> Result<Response<RemoveContainerResponse>, Status> {
         let req = request.into_inner();
-        tracing::info!(
-            "Removing container: {} (force: {}, volumes: {})",
-            req.container_id,
-            req.force,
-            req.remove_volumes
-        );
+
+        if req.container_id.is_empty() {
+            return Err(Status::invalid_argument("container_id is required"));
+        }
+
+        self.service
+            .remove(&req.container_id, req.force, req.remove_volumes)
+            .await
+            .map_err(into_status)?;
+
         Ok(Response::new(RemoveContainerResponse {}))
     }
 
@@ -137,7 +177,16 @@ impl ContainerService for ContainerServiceImpl {
         request: Request<PauseContainerRequest>,
     ) -> Result<Response<PauseContainerResponse>, Status> {
         let req = request.into_inner();
-        tracing::info!("Pausing container: {}", req.container_id);
+
+        if req.container_id.is_empty() {
+            return Err(Status::invalid_argument("container_id is required"));
+        }
+
+        self.service
+            .pause(&req.container_id)
+            .await
+            .map_err(into_status)?;
+
         Ok(Response::new(PauseContainerResponse {}))
     }
 
@@ -146,7 +195,16 @@ impl ContainerService for ContainerServiceImpl {
         request: Request<UnpauseContainerRequest>,
     ) -> Result<Response<UnpauseContainerResponse>, Status> {
         let req = request.into_inner();
-        tracing::info!("Unpausing container: {}", req.container_id);
+
+        if req.container_id.is_empty() {
+            return Err(Status::invalid_argument("container_id is required"));
+        }
+
+        self.service
+            .unpause(&req.container_id)
+            .await
+            .map_err(into_status)?;
+
         Ok(Response::new(UnpauseContainerResponse {}))
     }
 
@@ -157,42 +215,44 @@ impl ContainerService for ContainerServiceImpl {
         request: Request<GetLogsRequest>,
     ) -> Result<Response<Self::GetLogsStream>, Status> {
         let req = request.into_inner();
-        tracing::info!(
-            "Getting logs for container: {} (follow: {})",
-            req.container_id,
-            req.follow
-        );
 
-        let output = stream! {
-            let log_messages = [
-                ("stdout", "Container started"),
-                ("stdout", "Application running"),
-                ("stderr", "Health check passed"),
-            ];
+        if req.container_id.is_empty() {
+            return Err(Status::invalid_argument("container_id is required"));
+        }
 
-            for (stream_type, message) in log_messages {
-                yield Ok(LogEntry {
-                    timestamp: now_timestamp(),
-                    stream: stream_type.to_string(),
-                    message: message.to_string(),
-                });
-            }
+        let params = GetLogsParams {
+            container_id: req.container_id,
+            follow: req.follow,
+            stdout: req.stdout,
+            stderr: req.stderr,
+            since: req.since,
+            until: req.until,
+            timestamps: req.timestamps,
+            tail: req.tail,
         };
+
+        let stream = self.service.get_logs(params);
+        let output = stream.map(|result| result.map(log_entry_to_grpc).map_err(into_status));
 
         Ok(Response::new(Box::pin(output)))
     }
 
     async fn exec(&self, request: Request<ExecRequest>) -> Result<Response<ExecResponse>, Status> {
         let req = request.into_inner();
-        let cmd = req.config.as_ref().map(|c| &c.cmd);
-        tracing::info!(
-            "Creating exec instance in container: {} with cmd: {:?}",
-            req.container_id,
-            cmd
-        );
-        Ok(Response::new(ExecResponse {
-            exec_id: "stub-exec-id".to_string(),
-        }))
+
+        if req.container_id.is_empty() {
+            return Err(Status::invalid_argument("container_id is required"));
+        }
+
+        let config = req.config.map(exec_config_from_grpc).unwrap_or_default();
+
+        let exec_id = self
+            .service
+            .exec_create(&req.container_id, config)
+            .await
+            .map_err(into_status)?;
+
+        Ok(Response::new(ExecResponse { exec_id }))
     }
 
     type ExecStartStream = StreamResult<ExecOutput>;
@@ -202,22 +262,13 @@ impl ContainerService for ContainerServiceImpl {
         request: Request<ExecStartRequest>,
     ) -> Result<Response<Self::ExecStartStream>, Status> {
         let req = request.into_inner();
-        tracing::info!("Starting exec: {}", req.exec_id);
 
-        let output = stream! {
-            let outputs = [
-                "Command executed successfully\n",
-                "Output line 1\n",
-                "Output line 2\n",
-            ];
+        if req.exec_id.is_empty() {
+            return Err(Status::invalid_argument("exec_id is required"));
+        }
 
-            for data in outputs {
-                yield Ok(ExecOutput {
-                    stream: "stdout".to_string(),
-                    data: data.as_bytes().to_vec(),
-                });
-            }
-        };
+        let stream = self.service.exec_start(&req.exec_id);
+        let output = stream.map(|result| result.map(exec_output_to_grpc).map_err(into_status));
 
         Ok(Response::new(Box::pin(output)))
     }
@@ -228,31 +279,25 @@ impl ContainerService for ContainerServiceImpl {
         &self,
         request: Request<Streaming<AttachRequest>>,
     ) -> Result<Response<Self::AttachStream>, Status> {
-        tracing::info!("Attaching to container");
+        let input_stream = request.into_inner();
 
-        let mut input_stream = request.into_inner();
+        let mapped_input = input_stream.map(|result| {
+            result
+                .map(|req| AttachInput {
+                    container_id: req.container_id,
+                    stream: req.stream,
+                    stdin: req.stdin,
+                    stdout: req.stdout,
+                    stderr: req.stderr,
+                    detach_keys: req.detach_keys,
+                    logs: req.logs,
+                    input: req.input,
+                })
+                .map_err(|e| ross_container::ContainerError::InvalidArgument(e.to_string()))
+        });
 
-        let output = stream! {
-            while let Some(result) = input_stream.next().await {
-                match result {
-                    Ok(attach_req) => {
-                        tracing::info!(
-                            "Received attach input for container: {}, {} bytes",
-                            attach_req.container_id,
-                            attach_req.input.len()
-                        );
-                        yield Ok(AttachOutput {
-                            stream: "stdout".to_string(),
-                            data: attach_req.input,
-                        });
-                    }
-                    Err(e) => {
-                        tracing::warn!("Error receiving attach input: {}", e);
-                        break;
-                    }
-                }
-            }
-        };
+        let stream = self.service.attach(mapped_input);
+        let output = stream.map(|result| result.map(attach_output_to_grpc).map_err(into_status));
 
         Ok(Response::new(Box::pin(output)))
     }
@@ -262,14 +307,20 @@ impl ContainerService for ContainerServiceImpl {
         request: Request<WaitContainerRequest>,
     ) -> Result<Response<WaitContainerResponse>, Status> {
         let req = request.into_inner();
-        tracing::info!(
-            "Waiting for container: {} with condition: {}",
-            req.container_id,
-            req.condition
-        );
+
+        if req.container_id.is_empty() {
+            return Err(Status::invalid_argument("container_id is required"));
+        }
+
+        let result = self
+            .service
+            .wait(&req.container_id, &req.condition)
+            .await
+            .map_err(into_status)?;
+
         Ok(Response::new(WaitContainerResponse {
-            status_code: 0,
-            error: None,
+            status_code: result.status_code,
+            error: result.error.map(|msg| ross_core::WaitError { message: msg }),
         }))
     }
 
@@ -278,11 +329,16 @@ impl ContainerService for ContainerServiceImpl {
         request: Request<KillContainerRequest>,
     ) -> Result<Response<KillContainerResponse>, Status> {
         let req = request.into_inner();
-        tracing::info!(
-            "Killing container: {} with signal: {}",
-            req.container_id,
-            req.signal
-        );
+
+        if req.container_id.is_empty() {
+            return Err(Status::invalid_argument("container_id is required"));
+        }
+
+        self.service
+            .kill(&req.container_id, &req.signal)
+            .await
+            .map_err(into_status)?;
+
         Ok(Response::new(KillContainerResponse {}))
     }
 
@@ -291,11 +347,20 @@ impl ContainerService for ContainerServiceImpl {
         request: Request<RenameContainerRequest>,
     ) -> Result<Response<RenameContainerResponse>, Status> {
         let req = request.into_inner();
-        tracing::info!(
-            "Renaming container: {} to: {}",
-            req.container_id,
-            req.new_name
-        );
+
+        if req.container_id.is_empty() {
+            return Err(Status::invalid_argument("container_id is required"));
+        }
+
+        if req.new_name.is_empty() {
+            return Err(Status::invalid_argument("new_name is required"));
+        }
+
+        self.service
+            .rename(&req.container_id, &req.new_name)
+            .await
+            .map_err(into_status)?;
+
         Ok(Response::new(RenameContainerResponse {}))
     }
 
@@ -306,48 +371,317 @@ impl ContainerService for ContainerServiceImpl {
         request: Request<StatsRequest>,
     ) -> Result<Response<Self::StatsStream>, Status> {
         let req = request.into_inner();
-        tracing::info!(
-            "Getting stats for container: {} (stream: {})",
-            req.container_id,
-            req.stream
-        );
 
-        let output = stream! {
-            for i in 0..3 {
-                yield Ok(StatsResponse {
-                    read: now_timestamp(),
-                    preread: now_timestamp(),
-                    pids_stats: None,
-                    blkio_stats: None,
-                    num_procs: 1,
-                    storage_stats: None,
-                    cpu_stats: Some(CpuStats {
-                        cpu_usage: Some(CpuUsage {
-                            total_usage: 1000000 * (i + 1),
-                            percpu_usage: vec![500000 * (i + 1)],
-                            usage_in_kernelmode: 100000 * (i + 1),
-                            usage_in_usermode: 900000 * (i + 1),
-                        }),
-                        system_cpu_usage: 10000000000,
-                        online_cpus: 4,
-                        throttling_data: None,
-                    }),
-                    precpu_stats: None,
-                    memory_stats: Some(MemoryStats {
-                        usage: 52428800 + (i * 1048576),
-                        max_usage: 104857600,
-                        stats: Default::default(),
-                        failcnt: 0,
-                        limit: 1073741824,
-                        commit: 0,
-                        commit_peak: 0,
-                        private_working_set: 0,
-                    }),
-                    networks: Default::default(),
-                });
-            }
+        if req.container_id.is_empty() {
+            return Err(Status::invalid_argument("container_id is required"));
+        }
+
+        let params = StatsParams {
+            container_id: req.container_id,
+            stream: req.stream,
+            one_shot: req.one_shot,
         };
 
+        let stream = self.service.stats(params);
+        let output = stream.map(|result| result.map(stats_to_grpc).map_err(into_status));
+
         Ok(Response::new(Box::pin(output)))
+    }
+}
+
+fn into_status(e: ross_container::ContainerError) -> Status {
+    match e {
+        ross_container::ContainerError::NotFound(_) => Status::not_found(e.to_string()),
+        ross_container::ContainerError::AlreadyExists(_) => Status::already_exists(e.to_string()),
+        ross_container::ContainerError::NotRunning(_)
+        | ross_container::ContainerError::AlreadyRunning(_) => {
+            Status::failed_precondition(e.to_string())
+        }
+        ross_container::ContainerError::ExecNotFound(_) => Status::not_found(e.to_string()),
+        ross_container::ContainerError::InvalidArgument(_) => {
+            Status::invalid_argument(e.to_string())
+        }
+        ross_container::ContainerError::Io(_) => Status::internal(e.to_string()),
+    }
+}
+
+fn container_config_from_grpc(c: ross_core::ContainerConfig) -> ross_container::ContainerConfig {
+    ross_container::ContainerConfig {
+        hostname: c.hostname,
+        domainname: c.domainname,
+        user: c.user,
+        attach_stdin: c.attach_stdin,
+        attach_stdout: c.attach_stdout,
+        attach_stderr: c.attach_stderr,
+        exposed_ports: c.exposed_ports,
+        tty: c.tty,
+        open_stdin: c.open_stdin,
+        stdin_once: c.stdin_once,
+        env: c.env,
+        cmd: c.cmd,
+        entrypoint: c.entrypoint,
+        image: c.image,
+        labels: c.labels,
+        working_dir: c.working_dir,
+        network_disabled: c.network_disabled,
+        mac_address: c.mac_address,
+        stop_signal: c.stop_signal,
+        stop_timeout: c.stop_timeout,
+        shell: c.shell,
+    }
+}
+
+fn host_config_from_grpc(h: ross_core::HostConfig) -> ross_container::HostConfig {
+    ross_container::HostConfig {
+        binds: h.binds,
+        network_mode: h.network_mode,
+        port_bindings: h.port_bindings.into_iter().map(port_binding_from_grpc).collect(),
+        auto_remove: h.auto_remove,
+        privileged: h.privileged,
+        publish_all_ports: h.publish_all_ports,
+        readonly_rootfs: h.readonly_rootfs,
+    }
+}
+
+fn port_binding_from_grpc(p: ross_core::PortBinding) -> ross_container::PortBinding {
+    ross_container::PortBinding {
+        host_ip: p.host_ip,
+        host_port: p.host_port,
+        container_port: p.container_port,
+        protocol: p.protocol,
+    }
+}
+
+fn networking_config_from_grpc(n: ross_core::NetworkingConfig) -> ross_container::NetworkingConfig {
+    ross_container::NetworkingConfig {
+        endpoints_config: n
+            .endpoints_config
+            .into_iter()
+            .map(|(k, v)| (k, endpoint_config_from_grpc(v)))
+            .collect(),
+    }
+}
+
+fn endpoint_config_from_grpc(e: ross_core::EndpointConfig) -> ross_container::EndpointConfig {
+    ross_container::EndpointConfig {
+        network_id: e.network_id,
+        endpoint_id: e.endpoint_id,
+        gateway: e.gateway,
+        ip_address: e.ip_address,
+        ip_prefix_len: e.ip_prefix_len,
+        mac_address: e.mac_address,
+        aliases: e.aliases,
+    }
+}
+
+fn exec_config_from_grpc(e: ross_core::ExecConfig) -> ExecConfig {
+    ExecConfig {
+        attach_stdin: e.attach_stdin,
+        attach_stdout: e.attach_stdout,
+        attach_stderr: e.attach_stderr,
+        detach_keys: e.detach_keys,
+        tty: e.tty,
+        env: e.env,
+        cmd: e.cmd,
+        privileged: e.privileged,
+        user: e.user,
+        working_dir: e.working_dir,
+    }
+}
+
+fn container_to_grpc(c: ross_container::Container) -> ross_core::Container {
+    ross_core::Container {
+        id: c.id,
+        names: c.names,
+        image: c.image,
+        image_id: c.image_id,
+        command: c.command,
+        created: c.created,
+        state: c.state,
+        status: c.status,
+        ports: c.ports.into_iter().map(port_binding_to_grpc).collect(),
+        labels: c.labels,
+        size_rw: c.size_rw,
+        size_root_fs: c.size_root_fs,
+        host_config: None,
+        network_settings: None,
+        mounts: vec![],
+    }
+}
+
+fn port_binding_to_grpc(p: ross_container::PortBinding) -> ross_core::PortBinding {
+    ross_core::PortBinding {
+        host_ip: p.host_ip,
+        host_port: p.host_port,
+        container_port: p.container_port,
+        protocol: p.protocol,
+    }
+}
+
+fn inspection_to_grpc(i: ross_container::ContainerInspection) -> InspectContainerResponse {
+    InspectContainerResponse {
+        container: Some(container_to_grpc(i.container)),
+        state: Some(container_state_to_grpc(i.state)),
+        path: i.path,
+        args: i.args,
+        resolv_conf_path: i.resolv_conf_path,
+        hostname_path: i.hostname_path,
+        hosts_path: i.hosts_path,
+        log_path: i.log_path,
+        name: i.name,
+        restart_count: i.restart_count,
+        driver: i.driver,
+        platform: i.platform,
+        mount_label: i.mount_label,
+        process_label: i.process_label,
+        app_armor_profile: i.app_armor_profile,
+        exec_ids: i.exec_ids,
+        config: Some(container_config_to_grpc(i.config)),
+        host_config: Some(host_config_to_grpc(i.host_config)),
+        graph_driver: None,
+        network_settings: None,
+    }
+}
+
+fn container_state_to_grpc(s: ross_container::ContainerState) -> ross_core::ContainerState {
+    ross_core::ContainerState {
+        status: s.status,
+        running: s.running,
+        paused: s.paused,
+        restarting: s.restarting,
+        oom_killed: s.oom_killed,
+        dead: s.dead,
+        pid: s.pid,
+        exit_code: s.exit_code,
+        error: s.error,
+        started_at: s.started_at,
+        finished_at: s.finished_at,
+        health: None,
+    }
+}
+
+fn container_config_to_grpc(c: ross_container::ContainerConfig) -> ross_core::ContainerConfig {
+    ross_core::ContainerConfig {
+        hostname: c.hostname,
+        domainname: c.domainname,
+        user: c.user,
+        attach_stdin: c.attach_stdin,
+        attach_stdout: c.attach_stdout,
+        attach_stderr: c.attach_stderr,
+        exposed_ports: c.exposed_ports,
+        tty: c.tty,
+        open_stdin: c.open_stdin,
+        stdin_once: c.stdin_once,
+        env: c.env,
+        cmd: c.cmd,
+        entrypoint: c.entrypoint,
+        image: c.image,
+        labels: c.labels,
+        volumes: Default::default(),
+        working_dir: c.working_dir,
+        network_disabled: c.network_disabled,
+        mac_address: c.mac_address,
+        stop_signal: c.stop_signal,
+        stop_timeout: c.stop_timeout,
+        shell: c.shell,
+        healthcheck: None,
+    }
+}
+
+fn host_config_to_grpc(h: ross_container::HostConfig) -> ross_core::HostConfig {
+    ross_core::HostConfig {
+        binds: h.binds,
+        network_mode: h.network_mode,
+        port_bindings: h.port_bindings.into_iter().map(port_binding_to_grpc).collect(),
+        auto_remove: h.auto_remove,
+        privileged: h.privileged,
+        publish_all_ports: h.publish_all_ports,
+        readonly_rootfs: h.readonly_rootfs,
+        ..Default::default()
+    }
+}
+
+fn log_entry_to_grpc(l: ross_container::LogEntry) -> LogEntry {
+    LogEntry {
+        timestamp: Some(l.timestamp),
+        stream: l.stream,
+        message: l.message,
+    }
+}
+
+fn exec_output_to_grpc(e: ross_container::ExecOutput) -> ExecOutput {
+    ExecOutput {
+        stream: e.stream,
+        data: e.data,
+    }
+}
+
+fn attach_output_to_grpc(a: ross_container::AttachOutput) -> AttachOutput {
+    AttachOutput {
+        stream: a.stream,
+        data: a.data,
+    }
+}
+
+fn stats_to_grpc(s: ross_container::ContainerStats) -> StatsResponse {
+    StatsResponse {
+        read: s.read,
+        preread: s.preread,
+        pids_stats: None,
+        blkio_stats: None,
+        num_procs: s.num_procs,
+        storage_stats: None,
+        cpu_stats: s.cpu_stats.map(cpu_stats_to_grpc),
+        precpu_stats: s.precpu_stats.map(cpu_stats_to_grpc),
+        memory_stats: s.memory_stats.map(memory_stats_to_grpc),
+        networks: s
+            .networks
+            .into_iter()
+            .map(|(k, v)| (k, network_stats_to_grpc(v)))
+            .collect(),
+    }
+}
+
+fn cpu_stats_to_grpc(c: ross_container::CpuStats) -> ross_core::CpuStats {
+    ross_core::CpuStats {
+        cpu_usage: c.cpu_usage.map(cpu_usage_to_grpc),
+        system_cpu_usage: c.system_cpu_usage,
+        online_cpus: c.online_cpus,
+        throttling_data: None,
+    }
+}
+
+fn cpu_usage_to_grpc(c: ross_container::CpuUsage) -> ross_core::CpuUsage {
+    ross_core::CpuUsage {
+        total_usage: c.total_usage,
+        percpu_usage: c.percpu_usage,
+        usage_in_kernelmode: c.usage_in_kernelmode,
+        usage_in_usermode: c.usage_in_usermode,
+    }
+}
+
+fn memory_stats_to_grpc(m: ross_container::MemoryStats) -> ross_core::MemoryStats {
+    ross_core::MemoryStats {
+        usage: m.usage,
+        max_usage: m.max_usage,
+        stats: m.stats,
+        failcnt: m.failcnt,
+        limit: m.limit,
+        commit: m.commit,
+        commit_peak: m.commit_peak,
+        private_working_set: m.private_working_set,
+    }
+}
+
+fn network_stats_to_grpc(n: ross_container::NetworkStats) -> ross_core::NetworkStats {
+    ross_core::NetworkStats {
+        rx_bytes: n.rx_bytes,
+        rx_packets: n.rx_packets,
+        rx_errors: n.rx_errors,
+        rx_dropped: n.rx_dropped,
+        tx_bytes: n.tx_bytes,
+        tx_packets: n.tx_packets,
+        tx_errors: n.tx_errors,
+        tx_dropped: n.tx_dropped,
     }
 }
