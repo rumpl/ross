@@ -441,7 +441,7 @@ impl GrpcContainerService for ContainerServiceGrpc {
             _ => {
                 return Err(Status::invalid_argument(
                     "First message must be InteractiveStart",
-                ))
+                ));
             }
         };
 

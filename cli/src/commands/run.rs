@@ -1,10 +1,10 @@
 use ross_core::ross::container_service_client::ContainerServiceClient;
 use ross_core::ross::image_service_client::ImageServiceClient;
 use ross_core::ross::{
-    interactive_input, interactive_output, wait_container_output::Output, ContainerConfig,
-    CreateContainerRequest, HostConfig, InteractiveInput, InteractiveStart, PortBinding,
-    PullImageRequest, RemoveContainerRequest, StartContainerRequest, WaitContainerRequest,
-    WindowSize,
+    ContainerConfig, CreateContainerRequest, HostConfig, InteractiveInput, InteractiveStart,
+    PortBinding, PullImageRequest, RemoveContainerRequest, StartContainerRequest,
+    WaitContainerRequest, WindowSize, interactive_input, interactive_output,
+    wait_container_output::Output,
 };
 use std::io::Write;
 use tokio_stream::StreamExt;
@@ -285,7 +285,7 @@ async fn run_interactive_session(
     let input_tx_clone = input_tx.clone();
     std::thread::spawn(move || {
         let mut buf = [0u8; 1024];
-        
+
         loop {
             let n = unsafe {
                 libc::read(
@@ -294,11 +294,11 @@ async fn run_interactive_session(
                     buf.len(),
                 )
             };
-            
+
             if n <= 0 {
                 break;
             }
-            
+
             let msg = InteractiveInput {
                 input: Some(interactive_input::Input::Stdin(buf[..n as usize].to_vec())),
             };

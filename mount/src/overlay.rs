@@ -1,10 +1,10 @@
-use crate::error::MountError;
 use crate::MountSpec;
+use crate::error::MountError;
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use std::path::Path;
 
 /// Mount a filesystem based on the mount specification.
-/// 
+///
 /// Supports:
 /// - overlay: OverlayFS mount with lowerdir, upperdir, workdir options
 /// - bind: Bind mount from source to target
@@ -23,12 +23,8 @@ pub fn mount_overlay(spec: &MountSpec, target: &Path) -> Result<(), MountError> 
 
 fn mount_overlay_fs(spec: &MountSpec, target: &Path) -> Result<(), MountError> {
     let options = spec.options.join(",");
-    
-    tracing::info!(
-        "Mounting overlay at {:?} with options: {}",
-        target,
-        options
-    );
+
+    tracing::info!("Mounting overlay at {:?} with options: {}", target, options);
 
     mount(
         Some("overlay"),
@@ -45,9 +41,9 @@ fn mount_overlay_fs(spec: &MountSpec, target: &Path) -> Result<(), MountError> {
 
 fn mount_bind(spec: &MountSpec, target: &Path) -> Result<(), MountError> {
     let source = Path::new(&spec.source);
-    
+
     let mut flags = MsFlags::MS_BIND;
-    
+
     for opt in &spec.options {
         match opt.as_str() {
             "ro" => flags |= MsFlags::MS_RDONLY,
@@ -64,14 +60,8 @@ fn mount_bind(spec: &MountSpec, target: &Path) -> Result<(), MountError> {
         spec.options
     );
 
-    mount(
-        Some(source),
-        target,
-        None::<&str>,
-        flags,
-        None::<&str>,
-    )
-    .map_err(|e| MountError::MountFailed(format!("bind mount failed: {}", e)))?;
+    mount(Some(source), target, None::<&str>, flags, None::<&str>)
+        .map_err(|e| MountError::MountFailed(format!("bind mount failed: {}", e)))?;
 
     // Apply read-only flag in a second mount call if needed
     if spec.options.iter().any(|o| o == "ro") {
@@ -92,7 +82,7 @@ fn mount_bind(spec: &MountSpec, target: &Path) -> Result<(), MountError> {
 /// Unmount a filesystem at the given path.
 pub fn unmount(target: &Path) -> Result<(), MountError> {
     tracing::debug!("Unmounting {:?}", target);
-    
+
     umount2(target, MntFlags::MNT_DETACH)
         .map_err(|e| MountError::UnmountFailed(format!("unmount failed: {}", e)))?;
 
@@ -115,7 +105,7 @@ mod tests {
                 "workdir=/work".to_string(),
             ],
         );
-        
+
         assert_eq!(spec.mount_type, "overlay");
         assert_eq!(spec.options.len(), 3);
     }

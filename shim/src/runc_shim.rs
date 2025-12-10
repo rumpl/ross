@@ -7,8 +7,8 @@ use oci_spec::runtime::{
     ProcessBuilder, RootBuilder, Spec, SpecBuilder,
 };
 use ross_mount::MountSpec;
-use runc::options::{DeleteOpts, GlobalOpts, KillOpts};
 use runc::Runc;
+use runc::options::{DeleteOpts, GlobalOpts, KillOpts};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -102,7 +102,10 @@ impl RuncShim {
         self.mount_rootfs(&opts.mounts, &rootfs_path).await?;
 
         let spec = self.generate_spec(&opts, &rootfs_path)?;
-        tracing::info!("Generated OCI spec with args: {:?}", spec.process().as_ref().and_then(|p| p.args().as_ref()));
+        tracing::info!(
+            "Generated OCI spec with args: {:?}",
+            spec.process().as_ref().and_then(|p| p.args().as_ref())
+        );
         let spec_path = bundle_path.join("config.json");
         let spec_content = serde_json::to_string_pretty(&spec)?;
         tracing::debug!("OCI spec content: {}", &spec_content);
@@ -150,11 +153,7 @@ impl RuncShim {
         Ok(id)
     }
 
-    async fn mount_rootfs(
-        &self,
-        mounts: &[SnapshotMount],
-        target: &Path,
-    ) -> Result<(), ShimError> {
+    async fn mount_rootfs(&self, mounts: &[SnapshotMount], target: &Path) -> Result<(), ShimError> {
         if mounts.is_empty() {
             return Err(ShimError::Runc("No mounts provided".to_string()));
         }
@@ -166,7 +165,7 @@ impl RuncShim {
             mount.source,
             mount.options
         );
-        
+
         let spec = MountSpec::new(&mount.mount_type, &mount.source, mount.options.clone());
 
         ross_mount::mount_overlay(&spec, target)
@@ -233,12 +232,17 @@ impl RuncShim {
             .spawn()
             .map_err(|e| ShimError::Runc(format!("Failed to spawn runc: {}", e)))?;
 
-        let status = child.wait().await
+        let status = child
+            .wait()
+            .await
             .map_err(|e| ShimError::Runc(format!("Failed to wait for runc: {}", e)))?;
 
         if !status.success() {
             tracing::error!(container_id = %id, status = ?status, "runc run failed");
-            return Err(ShimError::Runc(format!("runc run failed with status: {}", status)));
+            return Err(ShimError::Runc(format!(
+                "runc run failed with status: {}",
+                status
+            )));
         }
 
         // Read PID from pid file
@@ -318,7 +322,7 @@ impl RuncShim {
                     actual: "running".to_string(),
                 });
             }
-            
+
             rootfs_path = PathBuf::from(&metadata.info.rootfs_path);
         }
 
@@ -408,7 +412,7 @@ impl RuncShim {
 
     async fn get_container_exit_code(&self, id: &str) -> Result<i32, ShimError> {
         let runc_root = self.data_dir.join("runc");
-        
+
         // Poll until container exits
         loop {
             let output = tokio::process::Command::new("runc")
@@ -419,29 +423,29 @@ impl RuncShim {
                 .output()
                 .await
                 .map_err(|e| ShimError::Runc(format!("Failed to get runc state: {}", e)))?;
-            
+
             if !output.status.success() {
                 // Container is gone, default to 0
                 return Ok(0);
             }
-            
+
             let state_json: serde_json::Value = serde_json::from_slice(&output.stdout)
                 .map_err(|e| ShimError::Runc(format!("Failed to parse runc state: {}", e)))?;
-            
+
             let status = state_json["status"].as_str().unwrap_or("");
             if status == "stopped" {
                 // Try to get exit code from state, default to 0
                 // Note: runc state doesn't include exit code directly
                 return Ok(0);
             }
-            
+
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
         }
     }
 
     pub async fn wait(&self, id: &str) -> Result<WaitResult, ShimError> {
         let runc_root = self.data_dir.join("runc");
-        
+
         loop {
             // Check runc state to see if container is still running
             let output = tokio::process::Command::new("runc")
@@ -452,7 +456,7 @@ impl RuncShim {
                 .output()
                 .await
                 .map_err(|e| ShimError::Runc(format!("Failed to get runc state: {}", e)))?;
-            
+
             let container_gone = !output.status.success();
             let is_stopped = if !container_gone {
                 let state_json: serde_json::Value = serde_json::from_slice(&output.stdout)
@@ -463,10 +467,10 @@ impl RuncShim {
             } else {
                 true
             };
-            
+
             if container_gone || is_stopped {
                 tracing::info!(container_id = %id, "Container has stopped");
-                
+
                 // Update internal state
                 let mut containers = self.containers.write().await;
                 if let Some(metadata) = containers.get_mut(id) {
@@ -479,7 +483,7 @@ impl RuncShim {
                     metadata.info.exit_code = Some(0); // TODO: get actual exit code
                     let _ = self.save_container(metadata).await;
                 }
-                
+
                 return Ok(WaitResult {
                     exit_code: 0,
                     error: None,
@@ -498,7 +502,7 @@ impl RuncShim {
     ) -> impl futures::Stream<Item = Result<OutputEvent, ShimError>> + Send + 'static {
         let data_dir = self.data_dir.clone();
         let containers = self.containers.clone();
-        
+
         async_stream::try_stream! {
             let bundle_path: PathBuf;
             {
@@ -523,7 +527,7 @@ impl RuncShim {
 
                 metadata.info.state = ContainerState::Running;
                 metadata.info.started_at = Some(now);
-                
+
                 let container_dir = data_dir.join("containers").join(&metadata.info.id);
                 fs::create_dir_all(&container_dir).await?;
                 let metadata_path = container_dir.join("metadata.json");
@@ -559,7 +563,7 @@ impl RuncShim {
 
             let mut stdout_reader = tokio::io::BufReader::new(stdout);
             let mut stderr_reader = tokio::io::BufReader::new(stderr);
-            
+
             let mut stdout_buf = vec![0u8; 4096];
             let mut stderr_buf = vec![0u8; 4096];
 
@@ -606,7 +610,7 @@ impl RuncShim {
                             metadata.info.state = ContainerState::Stopped;
                             metadata.info.finished_at = Some(now);
                             metadata.info.exit_code = Some(exit_code);
-                            
+
                             let container_dir = data_dir.join("containers").join(&metadata.info.id);
                             let metadata_path = container_dir.join("metadata.json");
                             if let Ok(content) = serde_json::to_string_pretty(&metadata) {
@@ -615,12 +619,12 @@ impl RuncShim {
                         }
 
                         tracing::info!(container_id = %id, exit_code = exit_code, "Container exited");
-                        
+
                         yield OutputEvent::Exit(WaitResult {
                             exit_code,
                             error: None,
                         });
-                        
+
                         break;
                     }
                 }
@@ -709,13 +713,14 @@ impl RuncShim {
             .map_err(|e| ShimError::Runc(format!("Failed to accept console socket: {}", e)))?;
 
         // Convert tokio UnixStream to std UnixStream for receiving fd
-        let std_stream = stream.into_std()
+        let std_stream = stream
+            .into_std()
             .map_err(|e| ShimError::Runc(format!("Failed to convert to std stream: {}", e)))?;
 
         // Receive the file descriptor
         let pty_master = receive_pty_fd(&std_stream)?;
         let raw_fd = pty_master.as_raw_fd();
-        
+
         // Set non-blocking mode for async I/O
         unsafe {
             let flags = libc::fcntl(raw_fd, libc::F_GETFL);
@@ -728,12 +733,12 @@ impl RuncShim {
         if write_fd < 0 {
             return Err(ShimError::Runc("Failed to dup PTY fd".to_string()));
         }
-        
+
         // Create separate AsyncFd instances for read and write
         let pty_read_file = unsafe { std::fs::File::from_raw_fd(read_fd) };
         std::mem::forget(pty_master); // Don't close the fd, pty_read_file owns it now
         let pty_write_file = unsafe { std::fs::File::from_raw_fd(write_fd) };
-        
+
         let pty_read_fd = tokio::io::unix::AsyncFd::new(pty_read_file)
             .map_err(|e| ShimError::Runc(format!("Failed to create read AsyncFd: {}", e)))?;
         let pty_write_fd = tokio::io::unix::AsyncFd::new(pty_write_file)
@@ -1122,7 +1127,8 @@ fn receive_pty_fd(stream: &std::os::unix::net::UnixStream) -> Result<OwnedFd, Sh
     use std::os::unix::io::RawFd;
 
     // Ensure the stream is in blocking mode for the recvmsg call
-    stream.set_nonblocking(false)
+    stream
+        .set_nonblocking(false)
         .map_err(|e| ShimError::Runc(format!("Failed to set socket to blocking: {}", e)))?;
 
     let mut buf = [0u8; 1];

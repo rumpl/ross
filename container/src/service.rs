@@ -54,10 +54,10 @@ impl ContainerService {
 
         // Get image config (includes top layer and default entrypoint/cmd)
         let image_config = self.get_image_config(image_ref).await?;
-        
-        let top_layer_digest = image_config.top_layer.ok_or_else(|| {
-            ContainerError::ImageNotFound("Image has no layers".to_string())
-        })?;
+
+        let top_layer_digest = image_config
+            .top_layer
+            .ok_or_else(|| ContainerError::ImageNotFound("Image has no layers".to_string()))?;
         tracing::info!("Found top layer: {}", top_layer_digest);
 
         // Verify the layer snapshot exists
@@ -187,15 +187,15 @@ impl ContainerService {
 
     async fn get_image_top_layer(&self, image_ref: &str) -> Result<String, ContainerError> {
         let image_config = self.get_image_config(image_ref).await?;
-        
-        image_config.top_layer.ok_or_else(|| {
-            ContainerError::ImageNotFound("Image has no layers".to_string())
-        })
+
+        image_config
+            .top_layer
+            .ok_or_else(|| ContainerError::ImageNotFound("Image has no layers".to_string()))
     }
 
     async fn get_image_config(&self, image_ref: &str) -> Result<ImageConfigInfo, ContainerError> {
         let (repository, tag) = parse_image_reference(image_ref);
-        
+
         tracing::debug!("Looking up image {}:{}", repository, tag);
 
         let tags = self.store.list_tags(&repository).await.map_err(|e| {
@@ -203,16 +203,21 @@ impl ContainerService {
         })?;
 
         let tag_info = tags.iter().find(|t| t.tag == tag).ok_or_else(|| {
-            ContainerError::ImageNotFound(format!("Tag {} not found for repository {}", tag, repository))
+            ContainerError::ImageNotFound(format!(
+                "Tag {} not found for repository {}",
+                tag, repository
+            ))
         })?;
 
         let manifest_digest = tag_info.digest.as_ref().ok_or_else(|| {
             ContainerError::ImageNotFound(format!("No digest for tag {}:{}", repository, tag))
         })?;
 
-        let (manifest_bytes, _media_type) = self.store.get_manifest(manifest_digest).await.map_err(|e| {
-            ContainerError::ImageNotFound(format!("Failed to get manifest: {}", e))
-        })?;
+        let (manifest_bytes, _media_type) = self
+            .store
+            .get_manifest(manifest_digest)
+            .await
+            .map_err(|e| ContainerError::ImageNotFound(format!("Failed to get manifest: {}", e)))?;
 
         #[derive(serde::Deserialize)]
         struct Manifest {
@@ -237,12 +242,20 @@ impl ContainerService {
         // Get the image config blob
         let config_digest = ross_store::Digest {
             algorithm: "sha256".to_string(),
-            hash: manifest.config.digest.trim_start_matches("sha256:").to_string(),
+            hash: manifest
+                .config
+                .digest
+                .trim_start_matches("sha256:")
+                .to_string(),
         };
 
-        let config_bytes = self.store.get_blob(&config_digest, 0, -1).await.map_err(|e| {
-            ContainerError::ImageNotFound(format!("Failed to get image config: {}", e))
-        })?;
+        let config_bytes = self
+            .store
+            .get_blob(&config_digest, 0, -1)
+            .await
+            .map_err(|e| {
+                ContainerError::ImageNotFound(format!("Failed to get image config: {}", e))
+            })?;
 
         #[derive(serde::Deserialize)]
         struct ImageConfig {
@@ -538,11 +551,11 @@ impl ContainerService {
         container_id: &str,
     ) -> impl futures::Stream<Item = Result<OutputEvent, ContainerError>> + Send + 'static {
         use futures::StreamExt;
-        
+
         tracing::info!("Waiting for container (streaming): {}", container_id);
 
         let stream = self.shim.run_streaming(container_id.to_string());
-        
+
         stream.map(|result| {
             result
                 .map(|event| match event {
@@ -640,7 +653,8 @@ impl ContainerService {
         let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<ross_shim::OutputEvent>(32);
 
         // Convert InputEvent to shim::InputEvent
-        let (shim_input_tx, shim_input_rx) = tokio::sync::mpsc::channel::<ross_shim::InputEvent>(32);
+        let (shim_input_tx, shim_input_rx) =
+            tokio::sync::mpsc::channel::<ross_shim::InputEvent>(32);
 
         let shim = self.shim.clone();
         let container_id_clone = container_id.clone();
@@ -698,7 +712,7 @@ impl ContainerService {
 
 fn parse_image_reference(image: &str) -> (String, String) {
     let image = image.trim();
-    
+
     // Extract tag/digest
     let (name_part, tag) = if let Some(at_idx) = image.rfind('@') {
         (&image[..at_idx], &image[at_idx + 1..])
@@ -712,7 +726,7 @@ fn parse_image_reference(image: &str) -> (String, String) {
     } else {
         (image, "latest")
     };
-    
+
     // Determine repository - need to match how the store indexes images
     // The store uses the format from ImageReference which stores:
     // - "library/nginx" for "nginx"
@@ -720,7 +734,7 @@ fn parse_image_reference(image: &str) -> (String, String) {
     let repository = if name_part.contains('/') {
         let first_slash = name_part.find('/').unwrap();
         let first_part = &name_part[..first_slash];
-        
+
         // Check if first part is a registry
         if first_part.contains('.') || first_part.contains(':') || first_part == "localhost" {
             // Has registry - repository is everything after first /
@@ -733,7 +747,7 @@ fn parse_image_reference(image: &str) -> (String, String) {
         // Simple name like "nginx" -> "library/nginx"
         format!("library/{}", name_part)
     };
-    
+
     (repository, tag.to_string())
 }
 

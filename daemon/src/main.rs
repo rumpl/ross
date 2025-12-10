@@ -66,7 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let addr = format!("{}:{}", host, port).parse()?;
 
             let store_path = data_dir.join("store");
-            tracing::info!("Initializing store at {:?}", store_path);
+            tracing::info!("Initisalizing store at {:?}", store_path);
             let store = FileSystemStore::new(&store_path).await?;
             let store = Arc::new(store);
 
@@ -104,9 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     snapshotter,
                 )))
                 .serve_with_shutdown(addr, async {
-                    signal::ctrl_c()
-                        .await
-                        .expect("failed to listen for ctrl-c");
+                    signal::ctrl_c().await.expect("failed to listen for ctrl-c");
                     tracing::info!("Received shutdown signal, stopping server...");
                 })
                 .await?;
