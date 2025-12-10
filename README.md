@@ -101,6 +101,9 @@ docker run --rm --network host ross-dev cli image list
 # Run a container
 docker run --rm --network host ross-dev cli run alpine echo "Hello from Ross!"
 
+# Run an interactive container with TTY
+docker run --rm -it --network host ross-dev cli run -it alpine sh
+
 # Run with options
 docker run --rm --network host ross-dev cli run \
     --name my-container \

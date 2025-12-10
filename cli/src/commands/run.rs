@@ -1,9 +1,10 @@
 use ross_core::ross::container_service_client::ContainerServiceClient;
 use ross_core::ross::image_service_client::ImageServiceClient;
 use ross_core::ross::{
-    ContainerConfig, CreateContainerRequest, HostConfig, PortBinding, PullImageRequest,
-    RemoveContainerRequest, StartContainerRequest, WaitContainerRequest,
-    wait_container_output::Output,
+    interactive_input, interactive_output, wait_container_output::Output, ContainerConfig,
+    CreateContainerRequest, HostConfig, InteractiveInput, InteractiveStart, PortBinding,
+    PullImageRequest, RemoveContainerRequest, StartContainerRequest, WaitContainerRequest,
+    WindowSize,
 };
 use std::io::Write;
 use tokio_stream::StreamExt;
@@ -147,46 +148,14 @@ pub async fn run_container(
         return Ok(());
     }
 
-    // For attached mode, use wait which starts and streams output
-    eprintln!("Starting and attaching to container...");
-    let mut wait_stream = container_client
-        .wait(WaitContainerRequest {
-            container_id: container_id.clone(),
-            condition: String::new(),
-        })
-        .await
-        .map_err(|e| format!("Failed to start/wait for container: {}", e))?
-        .into_inner();
+    let exit_code = if tty && interactive {
+        // Interactive mode with TTY - use bidirectional streaming
+        run_interactive_session(&mut container_client, &container_id).await?
+    } else {
+        // Non-interactive mode - use wait which starts and streams output
+        run_non_interactive(&mut container_client, &container_id).await?
+    };
 
-    let mut exit_code: i64 = 0;
-    
-    while let Some(output) = wait_stream.next().await {
-        match output {
-            Ok(msg) => match msg.output {
-                Some(Output::Data(data)) => {
-                    if data.stream == "stdout" {
-                        std::io::stdout().write_all(&data.data)?;
-                        std::io::stdout().flush()?;
-                    } else {
-                        std::io::stderr().write_all(&data.data)?;
-                        std::io::stderr().flush()?;
-                    }
-                }
-                Some(Output::Exit(result)) => {
-                    exit_code = result.status_code;
-                    if let Some(err) = result.error {
-                        eprintln!("Container error: {}", err.message);
-                    }
-                }
-                None => {}
-            },
-            Err(e) => {
-                eprintln!("Error reading container output: {}", e);
-                break;
-            }
-        }
-    }
-    
     eprintln!("Container exited with code: {}", exit_code);
 
     if rm {
@@ -217,4 +186,208 @@ fn parse_image_reference(image: &str) -> (String, String) {
         }
     }
     (image.to_string(), "latest".to_string())
+}
+
+async fn run_non_interactive(
+    client: &mut ContainerServiceClient<tonic::transport::Channel>,
+    container_id: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    eprintln!("Starting and attaching to container...");
+    let mut wait_stream = client
+        .wait(WaitContainerRequest {
+            container_id: container_id.to_string(),
+            condition: String::new(),
+        })
+        .await
+        .map_err(|e| format!("Failed to start/wait for container: {}", e))?
+        .into_inner();
+
+    let mut exit_code: i64 = 0;
+
+    while let Some(output) = wait_stream.next().await {
+        match output {
+            Ok(msg) => match msg.output {
+                Some(Output::Data(data)) => {
+                    if data.stream == "stdout" {
+                        std::io::stdout().write_all(&data.data)?;
+                        std::io::stdout().flush()?;
+                    } else {
+                        std::io::stderr().write_all(&data.data)?;
+                        std::io::stderr().flush()?;
+                    }
+                }
+                Some(Output::Exit(result)) => {
+                    exit_code = result.status_code;
+                    if let Some(err) = result.error {
+                        eprintln!("Container error: {}", err.message);
+                    }
+                }
+                None => {}
+            },
+            Err(e) => {
+                eprintln!("Error reading container output: {}", e);
+                break;
+            }
+        }
+    }
+
+    Ok(exit_code)
+}
+
+async fn run_interactive_session(
+    client: &mut ContainerServiceClient<tonic::transport::Channel>,
+    container_id: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    use tokio::io::AsyncWriteExt;
+
+    eprintln!("Starting interactive session...");
+
+    // Create the input stream starting with InteractiveStart
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<InteractiveInput>(32);
+
+    // Send the start message
+    input_tx
+        .send(InteractiveInput {
+            input: Some(interactive_input::Input::Start(InteractiveStart {
+                container_id: container_id.to_string(),
+                tty: true,
+            })),
+        })
+        .await
+        .map_err(|e| format!("Failed to send start message: {}", e))?;
+
+    // Get terminal size and send resize
+    if let Some((width, height)) = get_terminal_size() {
+        let _ = input_tx
+            .send(InteractiveInput {
+                input: Some(interactive_input::Input::Resize(WindowSize {
+                    width: width as u32,
+                    height: height as u32,
+                })),
+            })
+            .await;
+    }
+
+    // Convert receiver to stream
+    let input_stream = tokio_stream::wrappers::ReceiverStream::new(input_rx);
+
+    // Start the interactive RPC
+    let mut output_stream = client
+        .run_interactive(input_stream)
+        .await
+        .map_err(|e| format!("Failed to start interactive session: {}", e))?
+        .into_inner();
+
+    // Set up raw mode for terminal AFTER starting the RPC
+    let _raw_guard = setup_raw_mode();
+
+    // Spawn a thread to read stdin using libc::read directly
+    let input_tx_clone = input_tx.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        
+        loop {
+            let n = unsafe {
+                libc::read(
+                    libc::STDIN_FILENO,
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+            
+            if n <= 0 {
+                break;
+            }
+            
+            let msg = InteractiveInput {
+                input: Some(interactive_input::Input::Stdin(buf[..n as usize].to_vec())),
+            };
+            if input_tx_clone.blocking_send(msg).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Process output from container
+    let mut exit_code: i64 = 0;
+    let mut stdout = tokio::io::stdout();
+
+    while let Some(result) = output_stream.next().await {
+        match result {
+            Ok(msg) => match msg.output {
+                Some(interactive_output::Output::Data(data)) => {
+                    stdout.write_all(&data.data).await?;
+                    stdout.flush().await?;
+                }
+                Some(interactive_output::Output::Exit(result)) => {
+                    exit_code = result.status_code;
+                    break;
+                }
+                None => {}
+            },
+            Err(e) => {
+                eprintln!("Output stream error: {}", e);
+                break;
+            }
+        }
+    }
+
+    Ok(exit_code)
+}
+
+fn get_terminal_size() -> Option<(u16, u16)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = std::io::stdout().as_raw_fd();
+        unsafe {
+            let mut size: libc::winsize = std::mem::zeroed();
+            if libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) == 0 {
+                return Some((size.ws_col, size.ws_row));
+            }
+        }
+    }
+    None
+}
+
+struct RawModeGuard {
+    #[cfg(unix)]
+    original: Option<libc::termios>,
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if let Some(original) = &self.original {
+            unsafe {
+                use std::os::unix::io::AsRawFd;
+                let fd = std::io::stdin().as_raw_fd();
+                libc::tcsetattr(fd, libc::TCSANOW, original);
+            }
+        }
+    }
+}
+
+fn setup_raw_mode() -> RawModeGuard {
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd = std::io::stdin().as_raw_fd();
+        unsafe {
+            let mut original: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut original) == 0 {
+                let mut raw = original;
+                libc::cfmakeraw(&mut raw);
+                if libc::tcsetattr(fd, libc::TCSANOW, &raw) == 0 {
+                    return RawModeGuard {
+                        original: Some(original),
+                    };
+                }
+            }
+        }
+    }
+    RawModeGuard {
+        #[cfg(unix)]
+        original: None,
+    }
 }

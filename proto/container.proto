@@ -19,6 +19,7 @@ service ContainerService {
     rpc ExecStart (ExecStartRequest) returns (stream ExecOutput);
     rpc Attach (stream AttachRequest) returns (stream AttachOutput);
     rpc Wait (WaitContainerRequest) returns (stream WaitContainerOutput);
+    rpc RunInteractive (stream InteractiveInput) returns (stream InteractiveOutput);
     rpc Kill (KillContainerRequest) returns (KillContainerResponse);
     rpc Rename (RenameContainerRequest) returns (RenameContainerResponse);
     rpc Stats (StatsRequest) returns (stream StatsResponse);
@@ -656,4 +657,30 @@ message StatsRequest {
     string container_id = 1;
     bool stream = 2;
     bool one_shot = 3;
+}
+
+// Interactive Run (bidirectional streaming for -it mode)
+message InteractiveInput {
+    oneof input {
+        InteractiveStart start = 1;
+        bytes stdin = 2;
+        WindowSize resize = 3;
+    }
+}
+
+message InteractiveStart {
+    string container_id = 1;
+    bool tty = 2;
+}
+
+message WindowSize {
+    uint32 width = 1;
+    uint32 height = 2;
+}
+
+message InteractiveOutput {
+    oneof output {
+        OutputData data = 1;
+        ExitResult exit = 2;
+    }
 }

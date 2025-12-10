@@ -1,6 +1,7 @@
 use crate::error::ShimError;
 use crate::types::*;
 use futures::Stream;
+use nix::sys::termios;
 use oci_spec::runtime::{
     LinuxBuilder, LinuxNamespace, LinuxNamespaceBuilder, LinuxNamespaceType, Mount, MountBuilder,
     ProcessBuilder, RootBuilder, Spec, SpecBuilder,
@@ -10,10 +11,12 @@ use runc::options::{DeleteOpts, GlobalOpts, KillOpts};
 use runc::Runc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
+use tokio::net::UnixListener;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -403,6 +406,39 @@ impl RuncShim {
             .ok_or_else(|| ShimError::ContainerNotFound(id.to_string()))
     }
 
+    async fn get_container_exit_code(&self, id: &str) -> Result<i32, ShimError> {
+        let runc_root = self.data_dir.join("runc");
+        
+        // Poll until container exits
+        loop {
+            let output = tokio::process::Command::new("runc")
+                .arg("--root")
+                .arg(&runc_root)
+                .arg("state")
+                .arg(id)
+                .output()
+                .await
+                .map_err(|e| ShimError::Runc(format!("Failed to get runc state: {}", e)))?;
+            
+            if !output.status.success() {
+                // Container is gone, default to 0
+                return Ok(0);
+            }
+            
+            let state_json: serde_json::Value = serde_json::from_slice(&output.stdout)
+                .map_err(|e| ShimError::Runc(format!("Failed to parse runc state: {}", e)))?;
+            
+            let status = state_json["status"].as_str().unwrap_or("");
+            if status == "stopped" {
+                // Try to get exit code from state, default to 0
+                // Note: runc state doesn't include exit code directly
+                return Ok(0);
+            }
+            
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    }
+
     pub async fn wait(&self, id: &str) -> Result<WaitResult, ShimError> {
         let runc_root = self.data_dir.join("runc");
         
@@ -592,6 +628,281 @@ impl RuncShim {
         }
     }
 
+    /// Run a container interactively with a PTY for stdin/stdout.
+    /// This uses runc's console-socket feature to get a PTY master fd.
+    pub async fn run_interactive(
+        &self,
+        id: String,
+        mut input_rx: tokio::sync::mpsc::Receiver<InputEvent>,
+        output_tx: tokio::sync::mpsc::Sender<OutputEvent>,
+    ) -> Result<(), ShimError> {
+        let bundle_path: PathBuf;
+        {
+            let mut containers = self.containers.write().await;
+            let metadata = containers
+                .get_mut(&id)
+                .ok_or_else(|| ShimError::ContainerNotFound(id.clone()))?;
+
+            if metadata.info.state != ContainerState::Created {
+                return Err(ShimError::InvalidState {
+                    expected: "created".to_string(),
+                    actual: metadata.info.state.to_string(),
+                });
+            }
+
+            bundle_path = PathBuf::from(&metadata.info.bundle_path);
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+
+            metadata.info.state = ContainerState::Running;
+            metadata.info.started_at = Some(now);
+            self.save_container(metadata).await?;
+        }
+
+        let runc_root = self.data_dir.join("runc");
+        let pid_file = bundle_path.join("container.pid");
+        let console_socket_path = bundle_path.join("console.sock");
+
+        // Remove stale socket if exists
+        let _ = std::fs::remove_file(&console_socket_path);
+
+        // Create Unix socket to receive PTY master fd
+        let listener = UnixListener::bind(&console_socket_path)
+            .map_err(|e| ShimError::Runc(format!("Failed to create console socket: {}", e)))?;
+
+        tracing::info!(container_id = %id, bundle = ?bundle_path, "Starting container with runc run (interactive)");
+
+        // Spawn runc in a separate task since we need to accept the console socket
+        let runc_root_clone = runc_root.clone();
+        let bundle_path_clone = bundle_path.clone();
+        let pid_file_clone = pid_file.clone();
+        let console_socket_clone = console_socket_path.clone();
+        let id_clone = id.clone();
+
+        let runc_handle = tokio::task::spawn_blocking(move || {
+            std::process::Command::new("runc")
+                .arg("--root")
+                .arg(&runc_root_clone)
+                .arg("run")
+                .arg("--bundle")
+                .arg(&bundle_path_clone)
+                .arg("--pid-file")
+                .arg(&pid_file_clone)
+                .arg("--no-pivot")
+                .arg("--detach")
+                .arg("--console-socket")
+                .arg(&console_socket_clone)
+                .arg(&id_clone)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+        });
+
+        // Accept connection and receive PTY master fd
+        let (stream, _) = listener
+            .accept()
+            .await
+            .map_err(|e| ShimError::Runc(format!("Failed to accept console socket: {}", e)))?;
+
+        // Convert tokio UnixStream to std UnixStream for receiving fd
+        let std_stream = stream.into_std()
+            .map_err(|e| ShimError::Runc(format!("Failed to convert to std stream: {}", e)))?;
+
+        // Receive the file descriptor
+        let pty_master = receive_pty_fd(&std_stream)?;
+        let raw_fd = pty_master.as_raw_fd();
+        
+        // Set non-blocking mode for async I/O
+        unsafe {
+            let flags = libc::fcntl(raw_fd, libc::F_GETFL);
+            libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+
+        // Duplicate the fd so we can have separate read and write handles
+        let read_fd = raw_fd;
+        let write_fd = unsafe { libc::dup(raw_fd) };
+        if write_fd < 0 {
+            return Err(ShimError::Runc("Failed to dup PTY fd".to_string()));
+        }
+        
+        // Create separate AsyncFd instances for read and write
+        let pty_read_file = unsafe { std::fs::File::from_raw_fd(read_fd) };
+        std::mem::forget(pty_master); // Don't close the fd, pty_read_file owns it now
+        let pty_write_file = unsafe { std::fs::File::from_raw_fd(write_fd) };
+        
+        let pty_read_fd = tokio::io::unix::AsyncFd::new(pty_read_file)
+            .map_err(|e| ShimError::Runc(format!("Failed to create read AsyncFd: {}", e)))?;
+        let pty_write_fd = tokio::io::unix::AsyncFd::new(pty_write_file)
+            .map_err(|e| ShimError::Runc(format!("Failed to create write AsyncFd: {}", e)))?;
+
+        // Wait for runc to exit (it exits immediately with --detach)
+        let mut child = runc_handle
+            .await
+            .map_err(|e| ShimError::Runc(format!("Failed to join runc task: {}", e)))?
+            .map_err(|e| ShimError::Runc(format!("Failed to spawn runc: {}", e)))?;
+
+        // Wait for runc to complete - with --detach it exits after starting the container
+        let runc_status = child
+            .wait()
+            .map_err(|e| ShimError::Runc(format!("Failed to wait for runc: {}", e)))?;
+
+        if !runc_status.success() {
+            // Try to get error message from stderr
+            let mut stderr_output = String::new();
+            if let Some(mut stderr) = child.stderr.take() {
+                use std::io::Read;
+                let _ = stderr.read_to_string(&mut stderr_output);
+            }
+            return Err(ShimError::Runc(format!(
+                "runc run failed with status {}: {}",
+                runc_status, stderr_output
+            )));
+        }
+
+        tracing::info!(container_id = %id, "runc started container in detached mode");
+
+        let containers = self.containers.clone();
+        let data_dir = self.data_dir.clone();
+        let id_for_cleanup = id.clone();
+
+        // Read PTY output and send to output channel
+        let output_tx_clone = output_tx.clone();
+        let read_task = tokio::spawn(async move {
+            tracing::debug!("PTY read task started");
+            let mut buf = vec![0u8; 4096];
+            loop {
+                let result = pty_read_fd.readable().await;
+                match result {
+                    Ok(mut ready) => {
+                        match ready.try_io(|inner| {
+                            use std::io::Read;
+                            inner.get_ref().read(&mut buf)
+                        }) {
+                            Ok(Ok(0)) => {
+                                tracing::debug!("PTY EOF");
+                                break;
+                            }
+                            Ok(Ok(n)) => {
+                                tracing::debug!("Read {} bytes from PTY", n);
+                                if output_tx_clone
+                                    .send(OutputEvent::Stdout(buf[..n].to_vec()))
+                                    .await
+                                    .is_err()
+                                {
+                                    tracing::debug!("Output channel closed");
+                                    break;
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!("Error reading PTY: {}", e);
+                                break;
+                            }
+                            Err(_would_block) => {
+                                // Not ready, continue waiting
+                                continue;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Error waiting for PTY readable: {}", e);
+                        break;
+                    }
+                }
+            }
+            tracing::debug!("PTY read task exiting");
+        });
+
+        // Handle input from client
+        let write_task = tokio::spawn(async move {
+            tracing::debug!("PTY write task started");
+            while let Some(event) = input_rx.recv().await {
+                match event {
+                    InputEvent::Stdin(data) => {
+                        tracing::debug!("Writing {} bytes to PTY", data.len());
+                        loop {
+                            let result = pty_write_fd.writable().await;
+                            match result {
+                                Ok(mut ready) => {
+                                    match ready.try_io(|inner| {
+                                        use std::io::Write;
+                                        inner.get_ref().write_all(&data)
+                                    }) {
+                                        Ok(Ok(())) => {
+                                            tracing::debug!("Wrote to PTY successfully");
+                                            break;
+                                        }
+                                        Ok(Err(e)) => {
+                                            tracing::warn!("Error writing to PTY: {}", e);
+                                            return;
+                                        }
+                                        Err(_would_block) => {
+                                            // Not ready, continue waiting
+                                            continue;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Error waiting for PTY writable: {}", e);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    InputEvent::Resize { width, height } => {
+                        tracing::debug!("Resize requested: {}x{} (not implemented)", width, height);
+                    }
+                }
+            }
+            tracing::debug!("PTY write task exiting");
+        });
+
+        // Wait for PTY read task to complete (indicates container exited)
+        let _ = read_task.await;
+        write_task.abort();
+
+        // Get the exit code from the container
+        let exit_code = self.get_container_exit_code(&id).await.unwrap_or(-1);
+
+        // Update container state
+        {
+            let mut containers = containers.write().await;
+            if let Some(metadata) = containers.get_mut(&id_for_cleanup) {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs() as i64;
+                metadata.info.state = ContainerState::Stopped;
+                metadata.info.finished_at = Some(now);
+                metadata.info.exit_code = Some(exit_code);
+
+                let container_dir = data_dir.join("containers").join(&metadata.info.id);
+                let metadata_path = container_dir.join("metadata.json");
+                if let Ok(content) = serde_json::to_string_pretty(&metadata) {
+                    let _ = std::fs::write(&metadata_path, content);
+                }
+            }
+        }
+
+        tracing::info!(container_id = %id, exit_code = exit_code, "Container exited (interactive)");
+
+        // Send exit event
+        let _ = output_tx
+            .send(OutputEvent::Exit(WaitResult {
+                exit_code,
+                error: None,
+            }))
+            .await;
+
+        // Cleanup socket
+        let _ = std::fs::remove_file(&console_socket_path);
+
+        Ok(())
+    }
+
     fn generate_spec(&self, opts: &CreateContainerOpts, rootfs: &Path) -> Result<Spec, ShimError> {
         let args = if !opts.config.entrypoint.is_empty() {
             let mut args = opts.config.entrypoint.clone();
@@ -619,7 +930,7 @@ impl RuncShim {
         let (uid, gid) = parse_user(&user);
 
         let process = ProcessBuilder::default()
-            .terminal(false)  // Disable TTY - requires console socket support
+            .terminal(opts.config.tty)
             .user(
                 oci_spec::runtime::UserBuilder::default()
                     .uid(uid)
@@ -800,11 +1111,45 @@ fn parse_user(user: &str) -> (u32, u32) {
     }
 
     let parts: Vec<&str> = user.split(':').collect();
-    let uid = parts
-        .first()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let uid = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
     let gid = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(uid);
 
     (uid, gid)
+}
+
+fn receive_pty_fd(stream: &std::os::unix::net::UnixStream) -> Result<OwnedFd, ShimError> {
+    use std::io::IoSliceMut;
+    use std::os::unix::io::RawFd;
+
+    // Ensure the stream is in blocking mode for the recvmsg call
+    stream.set_nonblocking(false)
+        .map_err(|e| ShimError::Runc(format!("Failed to set socket to blocking: {}", e)))?;
+
+    let mut buf = [0u8; 1];
+    let mut iov = [IoSliceMut::new(&mut buf)];
+    let mut cmsg_buf = nix::cmsg_space!([RawFd; 1]);
+
+    let msg = nix::sys::socket::recvmsg::<()>(
+        stream.as_raw_fd(),
+        &mut iov,
+        Some(&mut cmsg_buf),
+        nix::sys::socket::MsgFlags::empty(),
+    )
+    .map_err(|e| ShimError::Runc(format!("Failed to receive PTY fd: {}", e)))?;
+
+    let cmsgs = msg
+        .cmsgs()
+        .map_err(|e| ShimError::Runc(format!("Failed to parse cmsgs: {}", e)))?;
+
+    for cmsg in cmsgs {
+        if let nix::sys::socket::ControlMessageOwned::ScmRights(fds) = cmsg {
+            if let Some(&fd) = fds.first() {
+                return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+        }
+    }
+
+    Err(ShimError::Runc(
+        "No file descriptor received from console socket".to_string(),
+    ))
 }

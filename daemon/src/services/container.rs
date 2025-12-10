@@ -1,18 +1,18 @@
 use ross_container::{
-    AttachInput, ContainerService, CreateContainerParams, ExecConfig, GetLogsParams,
+    AttachInput, ContainerService, CreateContainerParams, ExecConfig, GetLogsParams, InputEvent,
     ListContainersParams, OutputEvent, StatsParams,
 };
 use ross_core::container_service_server::ContainerService as GrpcContainerService;
 use ross_core::{
     AttachOutput, AttachRequest, CreateContainerRequest, CreateContainerResponse, ExecOutput,
     ExecRequest, ExecResponse, ExecStartRequest, GetLogsRequest, InspectContainerRequest,
-    InspectContainerResponse, KillContainerRequest, KillContainerResponse, ListContainersRequest,
-    ListContainersResponse, LogEntry, PauseContainerRequest, PauseContainerResponse,
-    RemoveContainerRequest, RemoveContainerResponse, RenameContainerRequest,
-    RenameContainerResponse, RestartContainerRequest, RestartContainerResponse,
-    StartContainerRequest, StartContainerResponse, StatsRequest, StatsResponse,
-    StopContainerRequest, StopContainerResponse, UnpauseContainerRequest, UnpauseContainerResponse,
-    WaitContainerRequest, WaitContainerOutput,
+    InspectContainerResponse, InteractiveInput, InteractiveOutput, KillContainerRequest,
+    KillContainerResponse, ListContainersRequest, ListContainersResponse, LogEntry,
+    PauseContainerRequest, PauseContainerResponse, RemoveContainerRequest, RemoveContainerResponse,
+    RenameContainerRequest, RenameContainerResponse, RestartContainerRequest,
+    RestartContainerResponse, StartContainerRequest, StartContainerResponse, StatsRequest,
+    StatsResponse, StopContainerRequest, StopContainerResponse, UnpauseContainerRequest,
+    UnpauseContainerResponse, WaitContainerOutput, WaitContainerRequest,
 };
 use std::pin::Pin;
 use std::sync::Arc;
@@ -419,6 +419,125 @@ impl GrpcContainerService for ContainerServiceGrpc {
         let output = stream.map(|result| result.map(stats_to_grpc).map_err(into_status));
 
         Ok(Response::new(Box::pin(output)))
+    }
+
+    type RunInteractiveStream = StreamResult<InteractiveOutput>;
+
+    async fn run_interactive(
+        &self,
+        request: Request<Streaming<InteractiveInput>>,
+    ) -> Result<Response<Self::RunInteractiveStream>, Status> {
+        let mut input_stream = request.into_inner();
+
+        // First message must be InteractiveStart
+        let first = input_stream
+            .next()
+            .await
+            .ok_or_else(|| Status::invalid_argument("Expected start message"))?
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        let start = match first.input {
+            Some(ross_core::interactive_input::Input::Start(s)) => s,
+            _ => {
+                return Err(Status::invalid_argument(
+                    "First message must be InteractiveStart",
+                ))
+            }
+        };
+
+        if start.container_id.is_empty() {
+            return Err(Status::invalid_argument("container_id is required"));
+        }
+
+        let (input_tx, mut output_stream) = self
+            .service
+            .run_interactive(start.container_id.clone(), start.tty)
+            .await
+            .map_err(into_status)?;
+
+        // Spawn task to forward input from gRPC stream to container
+        tokio::spawn(async move {
+            tracing::debug!("Input forwarding task started");
+            while let Some(result) = input_stream.next().await {
+                match result {
+                    Ok(msg) => {
+                        let event = match msg.input {
+                            Some(ross_core::interactive_input::Input::Stdin(data)) => {
+                                tracing::debug!("Received stdin from client: {} bytes", data.len());
+                                InputEvent::Stdin(data)
+                            }
+                            Some(ross_core::interactive_input::Input::Resize(size)) => {
+                                InputEvent::Resize {
+                                    width: size.width as u16,
+                                    height: size.height as u16,
+                                }
+                            }
+                            Some(ross_core::interactive_input::Input::Start(_)) => {
+                                tracing::warn!("Unexpected start message after session started");
+                                continue;
+                            }
+                            None => continue,
+                        };
+                        if input_tx.send(event).await.is_err() {
+                            tracing::debug!("Input channel closed");
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Error receiving input: {}", e);
+                        break;
+                    }
+                }
+            }
+            tracing::debug!("Input forwarding task ended");
+        });
+
+        // Map container output events to gRPC messages
+        let grpc_output = async_stream::stream! {
+            tracing::debug!("gRPC output stream started");
+            while let Some(result) = output_stream.next().await {
+                tracing::debug!("Got output from container service");
+                let grpc_msg = match result {
+                    Ok(OutputEvent::Stdout(data)) => {
+                        tracing::debug!("Sending {} bytes stdout to client", data.len());
+                        InteractiveOutput {
+                            output: Some(ross_core::interactive_output::Output::Data(
+                                ross_core::OutputData {
+                                    stream: "stdout".to_string(),
+                                    data,
+                                },
+                            )),
+                        }
+                    }
+                    Ok(OutputEvent::Stderr(data)) => {
+                        tracing::debug!("Sending {} bytes stderr to client", data.len());
+                        InteractiveOutput {
+                            output: Some(ross_core::interactive_output::Output::Data(
+                                ross_core::OutputData {
+                                    stream: "stderr".to_string(),
+                                    data,
+                                },
+                            )),
+                        }
+                    }
+                    Ok(OutputEvent::Exit(result)) => InteractiveOutput {
+                        output: Some(ross_core::interactive_output::Output::Exit(
+                            ross_core::ExitResult {
+                                status_code: result.status_code,
+                                error: result.error.map(|msg| ross_core::WaitError { message: msg }),
+                            },
+                        )),
+                    },
+                    Err(e) => {
+                        tracing::error!("Container output error: {}", e);
+                        break;
+                    }
+                };
+                yield Ok(grpc_msg);
+            }
+        };
+
+        Ok(Response::new(Box::pin(grpc_output)))
     }
 }
 

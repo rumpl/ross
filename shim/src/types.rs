@@ -85,3 +85,9 @@ pub enum OutputEvent {
     Stderr(Vec<u8>),
     Exit(WaitResult),
 }
+
+#[derive(Debug, Clone)]
+pub enum InputEvent {
+    Stdin(Vec<u8>),
+    Resize { width: u16, height: u16 },
+}

@@ -616,6 +616,84 @@ impl ContainerService {
 
         Box::pin(output)
     }
+
+    /// Run a container interactively with bidirectional streaming.
+    /// Returns a sender for input events and an output stream.
+    pub async fn run_interactive(
+        &self,
+        container_id: String,
+        tty: bool,
+    ) -> Result<
+        (
+            tokio::sync::mpsc::Sender<InputEvent>,
+            BoxStream<Result<OutputEvent, ContainerError>>,
+        ),
+        ContainerError,
+    > {
+        tracing::info!(
+            "Starting interactive session for container: {} (tty: {})",
+            container_id,
+            tty
+        );
+
+        let (input_tx, input_rx) = tokio::sync::mpsc::channel::<InputEvent>(32);
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<ross_shim::OutputEvent>(32);
+
+        // Convert InputEvent to shim::InputEvent
+        let (shim_input_tx, shim_input_rx) = tokio::sync::mpsc::channel::<ross_shim::InputEvent>(32);
+
+        let shim = self.shim.clone();
+        let container_id_clone = container_id.clone();
+
+        // Forward input events to shim format
+        tokio::spawn(async move {
+            let mut input_rx = input_rx;
+            while let Some(event) = input_rx.recv().await {
+                tracing::debug!("Forwarding input event to shim");
+                let shim_event = match event {
+                    InputEvent::Stdin(data) => {
+                        tracing::debug!("Forwarding stdin: {} bytes", data.len());
+                        ross_shim::InputEvent::Stdin(data)
+                    }
+                    InputEvent::Resize { width, height } => {
+                        ross_shim::InputEvent::Resize { width, height }
+                    }
+                };
+                if shim_input_tx.send(shim_event).await.is_err() {
+                    tracing::debug!("Shim input channel closed");
+                    break;
+                }
+            }
+            tracing::debug!("Input forwarding task exiting");
+        });
+
+        // Start the interactive session in the shim
+        tokio::spawn(async move {
+            if let Err(e) = shim
+                .run_interactive(container_id_clone, shim_input_rx, output_tx)
+                .await
+            {
+                tracing::error!("Interactive session error: {}", e);
+            }
+        });
+
+        // Create output stream from channel
+        let output_stream = stream! {
+            while let Some(event) = output_rx.recv().await {
+                let result = match event {
+                    ross_shim::OutputEvent::Stdout(data) => OutputEvent::Stdout(data),
+                    ross_shim::OutputEvent::Stderr(data) => OutputEvent::Stderr(data),
+                    ross_shim::OutputEvent::Exit(r) => OutputEvent::Exit(WaitResult {
+                        status_code: r.exit_code as i64,
+                        error: r.error,
+                    }),
+                };
+                yield Ok(result);
+            }
+        };
+
+        Ok((input_tx, Box::pin(output_stream)))
+    }
 }
 
 fn parse_image_reference(image: &str) -> (String, String) {

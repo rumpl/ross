@@ -267,3 +267,9 @@ pub struct NetworkStats {
     pub tx_errors: u64,
     pub tx_dropped: u64,
 }
+
+#[derive(Debug, Clone)]
+pub enum InputEvent {
+    Stdin(Vec<u8>),
+    Resize { width: u16, height: u16 },
+}
