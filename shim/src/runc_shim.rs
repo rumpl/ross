@@ -1,7 +1,7 @@
 use crate::error::ShimError;
+use crate::shim::{OutputEventStream, Shim};
 use crate::types::*;
-use futures::Stream;
-use nix::sys::termios;
+use async_trait::async_trait;
 use oci_spec::runtime::{
     LinuxBuilder, LinuxNamespace, LinuxNamespaceBuilder, LinuxNamespaceType, Mount, MountBuilder,
     ProcessBuilder, RootBuilder, Spec, SpecBuilder,
@@ -246,15 +246,14 @@ impl RuncShim {
         }
 
         // Read PID from pid file
-        if let Ok(pid_str) = fs::read_to_string(&pid_file).await {
-            if let Ok(pid) = pid_str.trim().parse::<u32>() {
+        if let Ok(pid_str) = fs::read_to_string(&pid_file).await
+            && let Ok(pid) = pid_str.trim().parse::<u32>() {
                 let mut containers = self.containers.write().await;
                 if let Some(metadata) = containers.get_mut(id) {
                     metadata.info.pid = Some(pid);
                     let _ = self.save_container(metadata).await;
                 }
             }
-        }
 
         tracing::info!(container_id = %id, "Container started");
         Ok(())
@@ -338,11 +337,10 @@ impl RuncShim {
         }
 
         // Unmount the rootfs
-        if rootfs_path.exists() {
-            if let Err(e) = ross_mount::unmount(&rootfs_path) {
+        if rootfs_path.exists()
+            && let Err(e) = ross_mount::unmount(&rootfs_path) {
                 tracing::warn!("Failed to unmount rootfs: {}", e);
             }
-        }
 
         let container_dir = self.data_dir.join("containers").join(id);
         if container_dir.exists() {
@@ -1122,6 +1120,62 @@ fn parse_user(user: &str) -> (u32, u32) {
     (uid, gid)
 }
 
+#[async_trait]
+impl Shim for RuncShim {
+    async fn create(&self, opts: CreateContainerOpts) -> Result<String, ShimError> {
+        self.create(opts).await
+    }
+
+    async fn start(&self, id: &str) -> Result<(), ShimError> {
+        self.start(id).await
+    }
+
+    async fn stop(&self, id: &str, timeout: u32) -> Result<(), ShimError> {
+        self.stop(id, timeout).await
+    }
+
+    async fn kill(&self, id: &str, signal: u32) -> Result<(), ShimError> {
+        self.kill(id, signal).await
+    }
+
+    async fn delete(&self, id: &str, force: bool) -> Result<(), ShimError> {
+        self.delete(id, force).await
+    }
+
+    async fn pause(&self, id: &str) -> Result<(), ShimError> {
+        self.pause(id).await
+    }
+
+    async fn resume(&self, id: &str) -> Result<(), ShimError> {
+        self.resume(id).await
+    }
+
+    async fn list(&self) -> Result<Vec<ContainerInfo>, ShimError> {
+        self.list().await
+    }
+
+    async fn get(&self, id: &str) -> Result<ContainerInfo, ShimError> {
+        self.get(id).await
+    }
+
+    async fn wait(&self, id: &str) -> Result<WaitResult, ShimError> {
+        self.wait(id).await
+    }
+
+    fn run_streaming(&self, id: String) -> OutputEventStream {
+        Box::pin(self.run_streaming(id))
+    }
+
+    async fn run_interactive(
+        &self,
+        id: String,
+        input_rx: tokio::sync::mpsc::Receiver<InputEvent>,
+        output_tx: tokio::sync::mpsc::Sender<OutputEvent>,
+    ) -> Result<(), ShimError> {
+        self.run_interactive(id, input_rx, output_tx).await
+    }
+}
+
 fn receive_pty_fd(stream: &std::os::unix::net::UnixStream) -> Result<OwnedFd, ShimError> {
     use std::io::IoSliceMut;
     use std::os::unix::io::RawFd;
@@ -1148,11 +1202,10 @@ fn receive_pty_fd(stream: &std::os::unix::net::UnixStream) -> Result<OwnedFd, Sh
         .map_err(|e| ShimError::Runc(format!("Failed to parse cmsgs: {}", e)))?;
 
     for cmsg in cmsgs {
-        if let nix::sys::socket::ControlMessageOwned::ScmRights(fds) = cmsg {
-            if let Some(&fd) = fds.first() {
+        if let nix::sys::socket::ControlMessageOwned::ScmRights(fds) = cmsg
+            && let Some(&fd) = fds.first() {
                 return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
             }
-        }
     }
 
     Err(ShimError::Runc(

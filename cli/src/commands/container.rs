@@ -734,11 +734,10 @@ async fn container_wait(
                 }
                 Some(Output::Exit(result)) => {
                     println!("{}", result.status_code);
-                    if let Some(err) = result.error {
-                        if !err.message.is_empty() {
+                    if let Some(err) = result.error
+                        && !err.message.is_empty() {
                             eprintln!("Error: {}", err.message);
                         }
-                    }
                 }
                 None => {}
             },

@@ -11,6 +11,9 @@ pub enum MountError {
     #[error("invalid mount specification: {0}")]
     InvalidSpec(String),
 
+    #[error("not supported: {0}")]
+    NotSupported(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 

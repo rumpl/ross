@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+libkrun = ["ross-container/libkrun"]
+
 [dependencies]
 async-stream = "0.3"
 clap = { version = "4", features = ["derive"] }

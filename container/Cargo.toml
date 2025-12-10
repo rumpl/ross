@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+libkrun = ["ross-shim/libkrun"]
+
 [dependencies]
 async-stream = "0.3"
 futures = "0.3"

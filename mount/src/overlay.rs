@@ -1,13 +1,16 @@
 use crate::MountSpec;
 use crate::error::MountError;
-use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use std::path::Path;
+
+#[cfg(target_os = "linux")]
+use nix::mount::{MntFlags, MsFlags, mount, umount2};
 
 /// Mount a filesystem based on the mount specification.
 ///
 /// Supports:
 /// - overlay: OverlayFS mount with lowerdir, upperdir, workdir options
 /// - bind: Bind mount from source to target
+#[cfg(target_os = "linux")]
 pub fn mount_overlay(spec: &MountSpec, target: &Path) -> Result<(), MountError> {
     std::fs::create_dir_all(target)?;
 
@@ -21,6 +24,14 @@ pub fn mount_overlay(spec: &MountSpec, target: &Path) -> Result<(), MountError> 
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn mount_overlay(_spec: &MountSpec, _target: &Path) -> Result<(), MountError> {
+    Err(MountError::NotSupported(
+        "overlay mounts are only supported on Linux".to_string(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
 fn mount_overlay_fs(spec: &MountSpec, target: &Path) -> Result<(), MountError> {
     let options = spec.options.join(",");
 
@@ -39,6 +50,7 @@ fn mount_overlay_fs(spec: &MountSpec, target: &Path) -> Result<(), MountError> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn mount_bind(spec: &MountSpec, target: &Path) -> Result<(), MountError> {
     let source = Path::new(&spec.source);
 
@@ -80,6 +92,7 @@ fn mount_bind(spec: &MountSpec, target: &Path) -> Result<(), MountError> {
 }
 
 /// Unmount a filesystem at the given path.
+#[cfg(target_os = "linux")]
 pub fn unmount(target: &Path) -> Result<(), MountError> {
     tracing::debug!("Unmounting {:?}", target);
 
@@ -88,6 +101,13 @@ pub fn unmount(target: &Path) -> Result<(), MountError> {
 
     tracing::info!("Unmounted {:?}", target);
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn unmount(_target: &Path) -> Result<(), MountError> {
+    Err(MountError::NotSupported(
+        "unmount is only supported on Linux".to_string(),
+    ))
 }
 
 #[cfg(test)]

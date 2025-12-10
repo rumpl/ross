@@ -1,7 +1,7 @@
 use crate::error::ContainerError;
 use crate::types::*;
 use async_stream::stream;
-use ross_shim::{CreateContainerOpts, RuncShim};
+use ross_shim::{CreateContainerOpts, KrunShim, RuncShim, Shim};
 use ross_snapshotter::OverlaySnapshotter;
 use ross_store::FileSystemStore;
 use std::collections::HashMap;
@@ -22,7 +22,7 @@ struct ImageConfigInfo {
 }
 
 pub struct ContainerService {
-    shim: Arc<RuncShim>,
+    shim: Arc<dyn Shim + Send + Sync>,
     snapshotter: Arc<OverlaySnapshotter>,
     #[allow(dead_code)]
     store: Arc<FileSystemStore>,
@@ -34,10 +34,22 @@ impl ContainerService {
         snapshotter: Arc<OverlaySnapshotter>,
         store: Arc<FileSystemStore>,
     ) -> Result<Self, ContainerError> {
-        let shim = RuncShim::new(&data_dir.join("shim")).await?;
+        // Try KrunShim first (for macOS), fall back to RuncShim
+        let shim: Arc<dyn Shim + Send + Sync> = {
+            #[cfg(target_os = "macos")]
+            {
+                tracing::info!("Using KrunShim for container runtime");
+                Arc::new(KrunShim::new(&data_dir.join("shim")).await?)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                tracing::info!("Using RuncShim for container runtime");
+                Arc::new(RuncShim::new(&data_dir.join("shim")).await?)
+            }
+        };
 
         Ok(Self {
-            shim: Arc::new(shim),
+            shim,
             snapshotter,
             store,
         })

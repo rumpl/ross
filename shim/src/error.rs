@@ -23,6 +23,12 @@ pub enum ShimError {
     #[error("oci spec error: {0}")]
     OciSpec(String),
 
+    #[error("runtime error: {0}")]
+    RuntimeError(String),
+
+    #[error("not supported: {0}")]
+    NotSupported(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

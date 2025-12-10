@@ -225,7 +225,11 @@ async fn run_non_interactive(
                 None => {}
             },
             Err(e) => {
-                eprintln!("Error reading container output: {}", e);
+                // Ignore stream closure errors - they're normal when container exits
+                let err_str = e.to_string();
+                if !err_str.contains("h2 protocol error") && !err_str.contains("stream closed") {
+                    eprintln!("Error reading container output: {}", e);
+                }
                 break;
             }
         }

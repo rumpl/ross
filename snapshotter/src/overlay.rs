@@ -482,10 +482,15 @@ fn parse_digest(digest: &str) -> Result<ross_store::Digest, SnapshotterError> {
 fn extract_tar_gz(data: &[u8], target_dir: &Path) -> Result<i64, SnapshotterError> {
     let decoder = GzDecoder::new(data);
     let mut archive = Archive::new(decoder);
-    archive.set_preserve_permissions(true);
-    archive.set_preserve_ownerships(true);
-    archive.set_unpack_xattrs(true);
     archive.set_overwrite(true);
+
+    // On macOS, we can't preserve Linux-specific permissions/ownerships
+    #[cfg(not(target_os = "macos"))]
+    {
+        archive.set_preserve_permissions(true);
+        archive.set_preserve_ownerships(true);
+        archive.set_unpack_xattrs(true);
+    }
 
     let mut total_size = 0i64;
 
@@ -498,8 +503,9 @@ fn extract_tar_gz(data: &[u8], target_dir: &Path) -> Result<i64, SnapshotterErro
 
         let path = entry.path().map_err(|e| {
             SnapshotterError::ExtractionFailed(format!("failed to get entry path: {}", e))
-        })?;
+        })?.into_owned();
 
+        // Handle whiteout files (OCI layer deletion markers)
         if let Some(name) = path.file_name() {
             let name_str = name.to_string_lossy();
             if name_str.starts_with(".wh.") {
@@ -528,10 +534,44 @@ fn extract_tar_gz(data: &[u8], target_dir: &Path) -> Result<i64, SnapshotterErro
             }
         }
 
+        // Skip device nodes on macOS (can't create them without root)
+        #[cfg(target_os = "macos")]
+        {
+            let entry_type = entry.header().entry_type();
+            if entry_type == tar::EntryType::Char || entry_type == tar::EntryType::Block {
+                tracing::debug!("Skipping device node: {:?}", path);
+                continue;
+            }
+        }
+
         total_size += entry.size() as i64;
-        entry.unpack_in(target_dir).map_err(|e| {
-            SnapshotterError::ExtractionFailed(format!("failed to unpack entry: {}", e))
-        })?;
+        
+        // Try to unpack, but on macOS handle failures gracefully for special files
+        #[cfg(target_os = "macos")]
+        {
+            let entry_type = entry.header().entry_type();
+            if let Err(e) = entry.unpack_in(target_dir) {
+                // Only error for regular files/dirs, skip special files
+                if entry_type == tar::EntryType::Regular 
+                    || entry_type == tar::EntryType::Directory
+                    || entry_type == tar::EntryType::Symlink
+                    || entry_type == tar::EntryType::Link
+                {
+                    return Err(SnapshotterError::ExtractionFailed(format!(
+                        "failed to unpack {:?}: {}",
+                        path, e
+                    )));
+                }
+                tracing::debug!("Skipping special file {:?}: {}", path, e);
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            entry.unpack_in(target_dir).map_err(|e| {
+                SnapshotterError::ExtractionFailed(format!("failed to unpack entry: {}", e))
+            })?;
+        }
     }
 
     Ok(total_size)

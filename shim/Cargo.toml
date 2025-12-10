@@ -4,20 +4,31 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+libkrun = ["krun-sys"]
+
 [dependencies]
 async-stream = "0.3"
+async-trait = "0.1"
+flate2 = "1"
 futures = "0.3"
+krun-sys = { version = "1.10", optional = true }
 libc = "0.2"
 oci-spec = "0.7"
 ross-mount = { path = "../mount" }
 runc = { version = "0.3", features = ["async"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tar = "0.4"
 thiserror = "2"
 tokio = { version = "1", features = ["full", "fs", "process"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 nix = { version = "0.29", features = ["term", "socket", "process"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+os_pipe = "1"
 
 [dev-dependencies]
 tempfile = "3"
