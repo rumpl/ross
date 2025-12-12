@@ -3,9 +3,9 @@
 //! Since libkrun doesn't support overlay mounts like runc, we need to
 //! flatten all layers into a single directory.
 
+use crate::ShimError;
 use crate::rootfs as common_rootfs;
 use crate::types::SnapshotMount;
-use crate::ShimError;
 use std::path::Path;
 use tokio::fs;
 

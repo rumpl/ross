@@ -247,13 +247,14 @@ impl RuncShim {
 
         // Read PID from pid file
         if let Ok(pid_str) = fs::read_to_string(&pid_file).await
-            && let Ok(pid) = pid_str.trim().parse::<u32>() {
-                let mut containers = self.containers.write().await;
-                if let Some(metadata) = containers.get_mut(id) {
-                    metadata.info.pid = Some(pid);
-                    let _ = self.save_container(metadata).await;
-                }
+            && let Ok(pid) = pid_str.trim().parse::<u32>()
+        {
+            let mut containers = self.containers.write().await;
+            if let Some(metadata) = containers.get_mut(id) {
+                metadata.info.pid = Some(pid);
+                let _ = self.save_container(metadata).await;
             }
+        }
 
         tracing::info!(container_id = %id, "Container started");
         Ok(())
@@ -338,9 +339,10 @@ impl RuncShim {
 
         // Unmount the rootfs
         if rootfs_path.exists()
-            && let Err(e) = ross_mount::unmount(&rootfs_path) {
-                tracing::warn!("Failed to unmount rootfs: {}", e);
-            }
+            && let Err(e) = ross_mount::unmount(&rootfs_path)
+        {
+            tracing::warn!("Failed to unmount rootfs: {}", e);
+        }
 
         let container_dir = self.data_dir.join("containers").join(id);
         if container_dir.exists() {
@@ -1203,9 +1205,10 @@ fn receive_pty_fd(stream: &std::os::unix::net::UnixStream) -> Result<OwnedFd, Sh
 
     for cmsg in cmsgs {
         if let nix::sys::socket::ControlMessageOwned::ScmRights(fds) = cmsg
-            && let Some(&fd) = fds.first() {
-                return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
-            }
+            && let Some(&fd) = fds.first()
+        {
+            return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+        }
     }
 
     Err(ShimError::Runc(

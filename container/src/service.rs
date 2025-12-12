@@ -1,9 +1,9 @@
 use crate::error::ContainerError;
 use crate::types::*;
 use async_stream::stream;
-use ross_shim::{CreateContainerOpts, KrunShim, Shim};
 #[cfg(not(target_os = "macos"))]
 use ross_shim::RuncShim;
+use ross_shim::{CreateContainerOpts, KrunShim, Shim};
 use ross_snapshotter::OverlaySnapshotter;
 use ross_store::FileSystemStore;
 use std::collections::HashMap;

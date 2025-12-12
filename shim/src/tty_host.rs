@@ -111,7 +111,7 @@ pub fn is_tty() -> bool {
 /// Run the host-side I/O loop using poll() (macOS compatible).
 #[cfg(unix)]
 pub fn run_io_host(listener: UnixListener, is_tty: bool) -> Result<u8, ShimError> {
-    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use std::mem::ManuallyDrop;
 
     let mut stdin = ManuallyDrop::new(unsafe { File::from_raw_fd(0) });
@@ -126,9 +126,7 @@ pub fn run_io_host(listener: UnixListener, is_tty: bool) -> Result<u8, ShimError
 
     set_nonblocking(remote.as_raw_fd())?;
 
-    if is_tty
-        && let Some((cols, rows)) = get_terminal_size()
-    {
+    if is_tty && let Some((cols, rows)) = get_terminal_size() {
         let _ = send_terminal_size(&mut remote, cols, rows);
     }
 
@@ -361,7 +359,7 @@ pub fn run_io_host_with_channels(
     output_tx: std::sync::mpsc::Sender<crate::types::OutputEvent>,
 ) -> Result<u8, ShimError> {
     use crate::types::{InputEvent, OutputEvent, WaitResult};
-    use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
     let (mut remote, _) = listener
         .accept()

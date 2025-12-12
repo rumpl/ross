@@ -419,9 +419,10 @@ impl Shim for KrunShim {
     ) -> Result<(), ShimError> {
         #[cfg(all(feature = "libkrun", target_os = "macos"))]
         {
-            use super::krun;
-            use crate::tty_host;
+            use super::krun::{self, NetworkConfig};
+            use super::network::{DEFAULT_MAC, GvproxyNetwork, gvproxy_available};
             use crate::guest_config::GuestConfig;
+            use crate::tty_host;
             use std::os::unix::net::UnixListener;
 
             let (config, rootfs_path): (ContainerConfig, PathBuf);
@@ -481,8 +482,36 @@ impl Shim for KrunShim {
                 vsock_port,
             };
 
+            // Start gvproxy for networking if available
+            let gvproxy = if gvproxy_available() {
+                match GvproxyNetwork::start(&id) {
+                    Ok(g) => {
+                        tracing::info!(container_id = %id, "gvproxy networking enabled");
+                        Some(g)
+                    }
+                    Err(e) => {
+                        tracing::warn!(container_id = %id, error = %e, "Failed to start gvproxy, falling back to TSI");
+                        None
+                    }
+                }
+            } else {
+                tracing::debug!(container_id = %id, "gvproxy not available, using TSI networking");
+                None
+            };
+
+            // Prepare network config if gvproxy is running
+            let network_config = gvproxy.as_ref().map(|g| NetworkConfig {
+                socket_path: g.socket_path().to_string(),
+                mac: DEFAULT_MAC,
+            });
+
             // Fork and start VM
-            let child_pid = krun::fork_and_run_vm_interactive(&rootfs_path, &guest_config, vsock_port)?;
+            let child_pid = krun::fork_and_run_vm_interactive_with_network(
+                &rootfs_path,
+                &guest_config,
+                vsock_port,
+                network_config,
+            )?;
 
             let is_tty = config.tty;
             let containers = self.containers.clone();
@@ -539,7 +568,9 @@ impl Shim for KrunShim {
                     metadata.info.state = ContainerState::Stopped;
                     metadata.info.exit_code = Some(exit_code);
                     metadata.info.finished_at = Some(Self::current_timestamp());
-                    let _ = metadata.save(&data_dir.join("containers").join(&id_clone)).await;
+                    let _ = metadata
+                        .save(&data_dir.join("containers").join(&id_clone))
+                        .await;
                 }
             }
 

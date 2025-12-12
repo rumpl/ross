@@ -33,16 +33,85 @@ fn setup_loopback() {
             ifr.ifr_flags = libc::IFF_UP as libc::c_short;
 
             // SIOCSIFFLAGS = 0x8914 on Linux
-            const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
-            libc::ioctl(sockfd, SIOCSIFFLAGS, &ifr);
+            nix::libc::ioctl(sockfd, 0x8914, &ifr);
             libc::close(sockfd);
         }
     }
 }
 
+fn setup_eth0() {
+    // Bring up eth0 interface if it exists (used when gvproxy/passt networking is enabled).
+    // The actual IP configuration will be done via DHCP.
+    #[repr(C)]
+    struct Ifreq {
+        ifr_name: [libc::c_char; libc::IFNAMSIZ],
+        ifr_flags: libc::c_short,
+        _pad: [u8; 22],
+    }
+
+    unsafe {
+        let sockfd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if sockfd >= 0 {
+            let mut ifr: Ifreq = std::mem::zeroed();
+            // Set interface name to "eth0"
+            ifr.ifr_name[0] = b'e' as libc::c_char;
+            ifr.ifr_name[1] = b't' as libc::c_char;
+            ifr.ifr_name[2] = b'h' as libc::c_char;
+            ifr.ifr_name[3] = b'0' as libc::c_char;
+            ifr.ifr_flags = libc::IFF_UP as libc::c_short;
+
+            // SIOCSIFFLAGS = 0x8914 on Linux
+            let ret = nix::libc::ioctl(sockfd, 0x8914, &ifr);
+            if ret == 0 {
+                eprintln!("ross-init: eth0 interface brought up");
+            }
+            libc::close(sockfd);
+        }
+    }
+}
+
+fn run_dhcp_client() {
+    // Try to run a DHCP client to get an IP address from gvproxy/passt.
+    // Both provide built-in DHCP servers.
+    // Try common DHCP client locations.
+    let dhcp_clients = [
+        ("/sbin/dhclient", vec!["-v", "eth0"]),
+        ("/sbin/udhcpc", vec!["-i", "eth0", "-f", "-q"]),
+        ("/usr/sbin/dhclient", vec!["-v", "eth0"]),
+        ("/usr/bin/dhcpcd", vec!["-4", "-q", "eth0"]),
+    ];
+
+    for (client, args) in &dhcp_clients {
+        if std::path::Path::new(client).exists() {
+            eprintln!("ross-init: running DHCP client: {} {:?}", client, args);
+            match std::process::Command::new(client)
+                .args(args)
+                .status()
+            {
+                Ok(status) if status.success() => {
+                    eprintln!("ross-init: DHCP client succeeded");
+                    return;
+                }
+                Ok(status) => {
+                    eprintln!("ross-init: DHCP client exited with: {}", status);
+                }
+                Err(e) => {
+                    eprintln!("ross-init: DHCP client failed: {}", e);
+                }
+            }
+        }
+    }
+
+    eprintln!("ross-init: no DHCP client found, network may not be configured");
+}
+
 fn main() -> ExitCode {
     // Set up loopback interface before anything else
     setup_loopback();
+
+    // Try to set up eth0 and get IP via DHCP (for gvproxy/passt networking)
+    setup_eth0();
+    run_dhcp_client();
 
     eprintln!("ross-init: starting");
     eprintln!("ross-init: args = {:?}", env::args().collect::<Vec<_>>());

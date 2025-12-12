@@ -72,9 +72,9 @@ pub fn extract_layer(layer_data: &[u8], target_dir: &Path) -> Result<(), ShimErr
             }
         }
 
-        entry.unpack_in(target_dir).map_err(|e| {
-            ShimError::BundlePreparationFailed(format!("failed to unpack: {}", e))
-        })?;
+        entry
+            .unpack_in(target_dir)
+            .map_err(|e| ShimError::BundlePreparationFailed(format!("failed to unpack: {}", e)))?;
     }
 
     Ok(())
@@ -130,15 +130,7 @@ where
 /// Ensures essential Linux directories exist in the rootfs.
 pub async fn ensure_essential_dirs(rootfs: &Path) -> Result<(), ShimError> {
     let essential_dirs = [
-        "dev",
-        "proc",
-        "sys",
-        "tmp",
-        "run",
-        "etc",
-        "var",
-        "var/log",
-        "var/tmp",
+        "dev", "proc", "sys", "tmp", "run", "etc", "var", "var/log", "var/tmp",
     ];
 
     for dir in essential_dirs {
@@ -183,9 +175,17 @@ pub async fn create_minimal_rootfs(target_dir: &Path) -> Result<(), ShimError> {
     )
     .await?;
 
-    fs::write(target_dir.join("etc/group"), "root:x:0:\nnogroup:x:65534:\n").await?;
+    fs::write(
+        target_dir.join("etc/group"),
+        "root:x:0:\nnogroup:x:65534:\n",
+    )
+    .await?;
 
-    fs::write(target_dir.join("etc/hosts"), "127.0.0.1 localhost\n::1 localhost\n").await?;
+    fs::write(
+        target_dir.join("etc/hosts"),
+        "127.0.0.1 localhost\n::1 localhost\n",
+    )
+    .await?;
 
     // Set up DNS for libkrun TSI networking
     fs::write(

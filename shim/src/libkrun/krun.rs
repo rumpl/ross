@@ -3,11 +3,22 @@
 //! This module handles the actual libkrun VM creation and execution,
 //! including the new TTY support via vsock.
 
-use crate::guest_config::GuestConfig;
 use crate::ShimError;
+use crate::guest_config::GuestConfig;
 use std::ffi::CString;
 use std::os::unix::io::RawFd;
 use std::path::Path;
+
+use super::network::{COMPAT_NET_FEATURES, NET_FLAG_VFKIT};
+
+/// Network configuration for the VM.
+#[derive(Clone, Debug)]
+pub struct NetworkConfig {
+    /// Path to gvproxy unix socket.
+    pub socket_path: String,
+    /// MAC address for the VM's network interface.
+    pub mac: [u8; 6],
+}
 
 pub fn set_rlimits() {
     unsafe {
@@ -73,7 +84,7 @@ pub fn fork_and_run_vm(
             libc::close(stdout_pipe[1]);
         }
 
-        run_vm_inner(rootfs_path, exec_path, argv, env, workdir, None);
+        run_vm_inner(rootfs_path, exec_path, argv, env, workdir, None, None);
     }
 
     unsafe {
@@ -85,26 +96,37 @@ pub fn fork_and_run_vm(
 
 /// Fork and run VM with vsock for interactive I/O.
 /// Returns child_pid on success.
+#[allow(dead_code)]
 pub fn fork_and_run_vm_interactive(
     rootfs_path: &Path,
     guest_config: &GuestConfig,
     vsock_port: u32,
 ) -> Result<libc::pid_t, ShimError> {
+    fork_and_run_vm_interactive_with_network(rootfs_path, guest_config, vsock_port, None)
+}
+
+/// Fork and run VM with vsock for interactive I/O and optional network configuration.
+/// Returns child_pid on success.
+pub fn fork_and_run_vm_interactive_with_network(
+    rootfs_path: &Path,
+    guest_config: &GuestConfig,
+    vsock_port: u32,
+    network_config: Option<NetworkConfig>,
+) -> Result<libc::pid_t, ShimError> {
     // Compute socket path before fork so both parent and child use the same path
     let socket_path = get_vsock_socket_path(vsock_port);
 
     // Write config to a file in the rootfs that ross-init can read
-    let config_json =
-        serde_json::to_string(guest_config).map_err(|e| ShimError::RuntimeError(format!("Failed to serialize config: {}", e)))?;
+    let config_json = serde_json::to_string(guest_config)
+        .map_err(|e| ShimError::RuntimeError(format!("Failed to serialize config: {}", e)))?;
     let config_path = rootfs_path.join(".ross-config.json");
-    
+
     tracing::debug!(config_path = %config_path.display(), config_len = config_json.len(), "Writing guest config file");
     tracing::trace!(config = %config_json, "Guest config contents");
-    
-    std::fs::write(&config_path, &config_json).map_err(|e| {
-        ShimError::RuntimeError(format!("Failed to write config file: {}", e))
-    })?;
-    
+
+    std::fs::write(&config_path, &config_json)
+        .map_err(|e| ShimError::RuntimeError(format!("Failed to write config file: {}", e)))?;
+
     // Verify the file was written
     match std::fs::read_to_string(&config_path) {
         Ok(contents) => {
@@ -133,6 +155,7 @@ pub fn fork_and_run_vm_interactive(
             &env,
             guest_config.workdir.as_deref(),
             Some((vsock_port, socket_path)),
+            network_config,
         );
     }
 
@@ -146,6 +169,7 @@ fn run_vm_inner(
     env: &[String],
     workdir: Option<&str>,
     vsock_config: Option<(u32, String)>,
+    network_config: Option<NetworkConfig>,
 ) -> ! {
     set_rlimits();
 
@@ -170,6 +194,38 @@ fn run_vm_inner(
     if let Some(wd) = workdir {
         let wd_cstr = CString::new(wd).unwrap();
         unsafe { krun_sys::krun_set_workdir(ctx_id, wd_cstr.as_ptr()) };
+    }
+
+    // Set up networking with gvproxy if configured.
+    // This uses unixgram sockets with the vfkit protocol.
+    // This must be done before krun_start_enter and disables TSI.
+    if let Some(ref net_cfg) = network_config {
+        eprintln!(
+            "ross-shim: configuring network with gvproxy socket: {}",
+            net_cfg.socket_path
+        );
+        let socket_cstr = CString::new(net_cfg.socket_path.as_bytes()).unwrap();
+        let mut mac = net_cfg.mac;
+
+        // Use krun_add_net_unixgram with vfkit flag for gvproxy compatibility
+        let ret = unsafe {
+            krun_sys::krun_add_net_unixgram(
+                ctx_id,
+                socket_cstr.as_ptr(), // path to gvproxy socket
+                -1,                   // fd = -1 since we use path
+                mac.as_mut_ptr(),     // MAC address
+                COMPAT_NET_FEATURES,  // features
+                NET_FLAG_VFKIT,       // send vfkit magic bytes
+            )
+        };
+
+        if ret < 0 {
+            eprintln!("Failed to configure network with gvproxy: {}", ret);
+            std::process::exit(1);
+        }
+        eprintln!("ross-shim: network configured successfully (ret={})", ret);
+    } else {
+        eprintln!("ross-shim: no network config provided, using TSI");
     }
 
     // Set up vsock port mapping for TTY communication
@@ -198,7 +254,12 @@ fn run_vm_inner(
     env_ptrs.push(std::ptr::null());
 
     if unsafe {
-        krun_sys::krun_set_exec(ctx_id, exec_cstr.as_ptr(), argv_ptrs.as_ptr(), env_ptrs.as_ptr())
+        krun_sys::krun_set_exec(
+            ctx_id,
+            exec_cstr.as_ptr(),
+            argv_ptrs.as_ptr(),
+            env_ptrs.as_ptr(),
+        )
     } < 0
     {
         eprintln!("Failed to set exec");

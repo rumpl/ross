@@ -501,9 +501,12 @@ fn extract_tar_gz(data: &[u8], target_dir: &Path) -> Result<i64, SnapshotterErro
             SnapshotterError::ExtractionFailed(format!("failed to read tar entry: {}", e))
         })?;
 
-        let path = entry.path().map_err(|e| {
-            SnapshotterError::ExtractionFailed(format!("failed to get entry path: {}", e))
-        })?.into_owned();
+        let path = entry
+            .path()
+            .map_err(|e| {
+                SnapshotterError::ExtractionFailed(format!("failed to get entry path: {}", e))
+            })?
+            .into_owned();
 
         // Handle whiteout files (OCI layer deletion markers)
         if let Some(name) = path.file_name() {
@@ -545,14 +548,14 @@ fn extract_tar_gz(data: &[u8], target_dir: &Path) -> Result<i64, SnapshotterErro
         }
 
         total_size += entry.size() as i64;
-        
+
         // Try to unpack, but on macOS handle failures gracefully for special files
         #[cfg(target_os = "macos")]
         {
             let entry_type = entry.header().entry_type();
             if let Err(e) = entry.unpack_in(target_dir) {
                 // Only error for regular files/dirs, skip special files
-                if entry_type == tar::EntryType::Regular 
+                if entry_type == tar::EntryType::Regular
                     || entry_type == tar::EntryType::Directory
                     || entry_type == tar::EntryType::Symlink
                     || entry_type == tar::EntryType::Link
