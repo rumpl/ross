@@ -11,6 +11,6 @@ mod shim;
 mod krun;
 
 #[cfg(all(feature = "libkrun", target_os = "macos"))]
-pub mod network;
+pub mod net;
 
 pub use shim::KrunShim;

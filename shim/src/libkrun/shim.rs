@@ -420,7 +420,7 @@ impl Shim for KrunShim {
         #[cfg(all(feature = "libkrun", target_os = "macos"))]
         {
             use super::krun::{self, NetworkConfig};
-            use super::network::{DEFAULT_MAC, GvproxyNetwork, gvproxy_available};
+            use super::net::{DEFAULT_MAC, VmNetwork, network_available};
             use crate::guest_config::GuestConfig;
             use crate::tty_host;
             use std::os::unix::net::UnixListener;
@@ -482,26 +482,26 @@ impl Shim for KrunShim {
                 vsock_port,
             };
 
-            // Start gvproxy for networking if available
-            let gvproxy = if gvproxy_available() {
-                match GvproxyNetwork::start(&id) {
-                    Ok(g) => {
-                        tracing::info!(container_id = %id, "gvproxy networking enabled");
-                        Some(g)
+            // Start userspace network stack if available
+            let network = if network_available() {
+                match VmNetwork::start(&id) {
+                    Ok(n) => {
+                        tracing::info!(container_id = %id, "Userspace network stack enabled");
+                        Some(n)
                     }
                     Err(e) => {
-                        tracing::warn!(container_id = %id, error = %e, "Failed to start gvproxy, falling back to TSI");
+                        tracing::warn!(container_id = %id, error = %e, "Failed to start network stack, falling back to TSI");
                         None
                     }
                 }
             } else {
-                tracing::debug!(container_id = %id, "gvproxy not available, using TSI networking");
+                tracing::debug!(container_id = %id, "Network stack not available, using TSI networking");
                 None
             };
 
-            // Prepare network config if gvproxy is running
-            let network_config = gvproxy.as_ref().map(|g| NetworkConfig {
-                socket_path: g.socket_path().to_string(),
+            // Prepare network config if network stack is running
+            let network_config = network.as_ref().map(|n| NetworkConfig {
+                socket_path: n.socket_path().to_string(),
                 mac: DEFAULT_MAC,
             });
 

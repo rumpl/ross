@@ -9,7 +9,7 @@ use std::ffi::CString;
 use std::os::unix::io::RawFd;
 use std::path::Path;
 
-use super::network::{COMPAT_NET_FEATURES, NET_FLAG_VFKIT};
+use super::net::{COMPAT_NET_FEATURES, NET_FLAG_VFKIT};
 
 /// Network configuration for the VM.
 #[derive(Clone, Debug)]
