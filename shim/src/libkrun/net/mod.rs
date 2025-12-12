@@ -18,6 +18,10 @@ pub const SUBNET_MASK: [u8; 4] = [255, 255, 255, 0];
 pub const GATEWAY_MAC: [u8; 6] = [0x02, 0x52, 0x4f, 0x53, 0x53, 0x01];
 pub const DEFAULT_MAC: [u8; 6] = [0x02, 0x52, 0x4f, 0x53, 0x53, 0x00];
 
+/// Special IP for ross.host.internal that maps to host's localhost.
+/// When the guest connects to this IP, NAT translates it to 127.0.0.1 on the host.
+pub const HOST_IP: [u8; 4] = [192, 168, 127, 254];
+
 /// Network features for virtio-net device.
 pub const COMPAT_NET_FEATURES: u32 = (1 << 0)   // CSUM
     | (1 << 1)   // GUEST_CSUM

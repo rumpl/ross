@@ -4,7 +4,7 @@ use super::eth::{
     build_eth_header, build_ip_header, checksum, tcp_udp_checksum, ETHERTYPE_IPV4, IP_PROTO_ICMP,
     IP_PROTO_TCP, IP_PROTO_UDP,
 };
-use super::GATEWAY_MAC;
+use super::{GATEWAY_MAC, HOST_IP};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
@@ -12,6 +12,19 @@ use std::time::{Duration, Instant};
 
 const MAX_SEGMENT_SIZE: usize = 1400;
 const TCP_WINDOW: u32 = 65535;
+
+/// Translate destination IP if it's the special host IP.
+/// Returns (actual_ip, original_ip) where actual_ip is what we connect to
+/// and original_ip is what we report back to the guest.
+fn translate_host_ip(dst_ip: &[u8]) -> ([u8; 4], [u8; 4]) {
+    let dst = [dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]];
+    if dst == HOST_IP {
+        // Translate to localhost
+        ([127, 0, 0, 1], dst)
+    } else {
+        (dst, dst)
+    }
+}
 
 /// TCP connection state.
 struct TcpNatEntry {
@@ -108,13 +121,18 @@ pub fn handle_udp(
     let dst_port = u16::from_be_bytes([payload[2], payload[3]]);
     let data = &payload[8..];
 
-    let key = ([dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]], dst_port, src_port);
+    // Translate HOST_IP to localhost
+    let (actual_ip, original_ip) = translate_host_ip(dst_ip);
+
+    // Key uses original IP so responses go back correctly
+    let key = (original_ip, dst_port, src_port);
 
     let entry = state.udp.entry(key).or_insert_with(|| {
         let socket = UdpSocket::bind("0.0.0.0:0").expect("bind UDP");
         socket.set_nonblocking(true).ok();
+        // Connect to actual IP (localhost for HOST_IP)
         let dst = SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3])),
+            IpAddr::V4(Ipv4Addr::new(actual_ip[0], actual_ip[1], actual_ip[2], actual_ip[3])),
             dst_port,
         );
         socket.connect(dst).ok();
@@ -132,9 +150,10 @@ pub fn handle_udp(
 
     let mut buf = [0u8; 65535];
     if let Ok(len) = entry.socket.recv(&mut buf) {
+        // Use original_ip in response so guest sees the IP it connected to
         return build_udp_response(
             &entry.client_mac, &entry.client_ip, entry.client_port,
-            dst_port, dst_ip, &buf[..len],
+            dst_port, &original_ip, &buf[..len],
         );
     }
     None
@@ -324,8 +343,11 @@ fn handle_tcp_syn(
     dst_port: u16,
     seq: u32,
 ) -> Option<Vec<u8>> {
+    // Translate HOST_IP to localhost
+    let (actual_ip, original_ip) = translate_host_ip(dst_ip);
+
     let dst = SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::new(dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3])),
+        IpAddr::V4(Ipv4Addr::new(actual_ip[0], actual_ip[1], actual_ip[2], actual_ip[3])),
         dst_port,
     );
 
@@ -342,7 +364,8 @@ fn handle_tcp_syn(
                 client_mac: [src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]],
                 client_ip: [src_ip[0], src_ip[1], src_ip[2], src_ip[3]],
                 client_port: src_port,
-                remote_ip: [dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]],
+                // Store original_ip so responses go back with the IP guest expects
+                remote_ip: original_ip,
                 remote_port: dst_port,
                 our_seq: our_seq.wrapping_add(1),
                 acked_seq: our_seq, // Guest hasn't ACKed anything yet
@@ -350,11 +373,11 @@ fn handle_tcp_syn(
                 last_active: Instant::now(),
             });
 
-            build_tcp_packet(src_mac, src_ip, src_port, dst_port, dst_ip, our_seq, expected_guest_seq, 0x12, &[])
+            build_tcp_packet(src_mac, src_ip, src_port, dst_port, &original_ip, our_seq, expected_guest_seq, 0x12, &[])
         }
         Err(e) => {
             tracing::debug!(error = %e, "TCP connect failed");
-            build_tcp_packet(src_mac, src_ip, src_port, dst_port, dst_ip, 0, seq.wrapping_add(1), 0x14, &[])
+            build_tcp_packet(src_mac, src_ip, src_port, dst_port, &original_ip, 0, seq.wrapping_add(1), 0x14, &[])
         }
     }
 }

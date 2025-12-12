@@ -1,11 +1,13 @@
-//! DNS forwarding.
+//! DNS forwarding with special handling for ross.host.internal.
 
 use super::eth::{build_eth_header, build_ip_header, tcp_udp_checksum, ETHERTYPE_IPV4, IP_PROTO_UDP};
-use super::{GATEWAY_IP, GATEWAY_MAC};
+use super::{GATEWAY_IP, GATEWAY_MAC, HOST_IP};
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
-/// Handle DNS query by forwarding to upstream.
+const ROSS_HOST_INTERNAL: &str = "ross.host.internal";
+
+/// Handle DNS query by forwarding to upstream or resolving special hostnames.
 pub fn handle_dns(
     query: &[u8],
     client_mac: &[u8],
@@ -16,6 +18,17 @@ pub fn handle_dns(
         return None;
     }
 
+    // Check if this is a query for ross.host.internal
+    if let Some(name) = parse_dns_query_name(query)
+        && name.eq_ignore_ascii_case(ROSS_HOST_INTERNAL)
+    {
+        tracing::debug!(name = %name, "Resolving special hostname to host IP");
+        if let Some(response) = build_dns_response(query, &HOST_IP) {
+            return build_udp_response(client_mac, client_ip, client_port, 53, &response);
+        }
+    }
+
+    // Forward to upstream DNS
     let dns_server: SocketAddr = "8.8.8.8:53".parse().ok()?;
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
@@ -28,6 +41,91 @@ pub fn handle_dns(
     tracing::debug!(len = len, "DNS response");
 
     build_udp_response(client_mac, client_ip, client_port, 53, response)
+}
+
+/// Parse the query name from a DNS query packet.
+fn parse_dns_query_name(query: &[u8]) -> Option<String> {
+    if query.len() < 12 {
+        return None;
+    }
+
+    // DNS header is 12 bytes, question section starts after
+    let mut pos = 12;
+    let mut name_parts = Vec::new();
+
+    while pos < query.len() {
+        let len = query[pos] as usize;
+        if len == 0 {
+            break;
+        }
+        if pos + 1 + len > query.len() {
+            return None;
+        }
+        let label = std::str::from_utf8(&query[pos + 1..pos + 1 + len]).ok()?;
+        name_parts.push(label.to_string());
+        pos += 1 + len;
+    }
+
+    if name_parts.is_empty() {
+        return None;
+    }
+
+    Some(name_parts.join("."))
+}
+
+/// Build a DNS response for an A record query.
+fn build_dns_response(query: &[u8], ip: &[u8; 4]) -> Option<Vec<u8>> {
+    if query.len() < 12 {
+        return None;
+    }
+
+    // Find the end of the question section
+    let mut pos = 12;
+    while pos < query.len() && query[pos] != 0 {
+        let len = query[pos] as usize;
+        pos += 1 + len;
+    }
+    // Skip null terminator + QTYPE (2) + QCLASS (2)
+    let question_end = pos + 5;
+    if question_end > query.len() {
+        return None;
+    }
+
+    let mut response = Vec::with_capacity(query.len() + 16);
+
+    // Copy transaction ID
+    response.extend_from_slice(&query[0..2]);
+
+    // Flags: standard response, no error
+    // QR=1 (response), Opcode=0, AA=1 (authoritative), TC=0, RD=1, RA=1, Z=0, RCODE=0
+    response.extend_from_slice(&[0x85, 0x80]);
+
+    // QDCOUNT = 1
+    response.extend_from_slice(&[0x00, 0x01]);
+    // ANCOUNT = 1
+    response.extend_from_slice(&[0x00, 0x01]);
+    // NSCOUNT = 0
+    response.extend_from_slice(&[0x00, 0x00]);
+    // ARCOUNT = 0
+    response.extend_from_slice(&[0x00, 0x00]);
+
+    // Copy question section
+    response.extend_from_slice(&query[12..question_end]);
+
+    // Answer section - use pointer to name in question (0xC00C = offset 12)
+    response.extend_from_slice(&[0xC0, 0x0C]);
+    // TYPE = A (1)
+    response.extend_from_slice(&[0x00, 0x01]);
+    // CLASS = IN (1)
+    response.extend_from_slice(&[0x00, 0x01]);
+    // TTL = 60 seconds
+    response.extend_from_slice(&[0x00, 0x00, 0x00, 0x3C]);
+    // RDLENGTH = 4
+    response.extend_from_slice(&[0x00, 0x04]);
+    // RDATA = IP address
+    response.extend_from_slice(ip);
+
+    Some(response)
 }
 
 fn build_udp_response(
