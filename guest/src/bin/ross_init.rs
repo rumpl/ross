@@ -14,7 +14,36 @@ use std::process::ExitCode;
 
 const CONFIG_FILE_PATH: &str = "/.ross-config.json";
 
+fn setup_loopback() {
+    // Bring up the loopback interface for localhost connectivity.
+    // This mirrors what libkrun's init does.
+    #[repr(C)]
+    struct Ifreq {
+        ifr_name: [libc::c_char; libc::IFNAMSIZ],
+        ifr_flags: libc::c_short,
+        _pad: [u8; 22],
+    }
+
+    unsafe {
+        let sockfd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if sockfd >= 0 {
+            let mut ifr: Ifreq = std::mem::zeroed();
+            ifr.ifr_name[0] = b'l' as libc::c_char;
+            ifr.ifr_name[1] = b'o' as libc::c_char;
+            ifr.ifr_flags = libc::IFF_UP as libc::c_short;
+
+            // SIOCSIFFLAGS = 0x8914 on Linux
+            const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
+            libc::ioctl(sockfd, SIOCSIFFLAGS, &ifr);
+            libc::close(sockfd);
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    // Set up loopback interface before anything else
+    setup_loopback();
+
     eprintln!("ross-init: starting");
     eprintln!("ross-init: args = {:?}", env::args().collect::<Vec<_>>());
     
