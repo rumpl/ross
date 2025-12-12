@@ -266,9 +266,16 @@ fn process_guest_message(
     stderr: &mut File,
 ) -> Result<Option<u8>, ShimError> {
     let mut cmd_buf = [0u8; 2];
-    remote
-        .read_exact(&mut cmd_buf)
-        .map_err(|e| ShimError::RuntimeError(format!("Failed to read from guest: {}", e)))?;
+    match remote.read_exact(&mut cmd_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+        Err(e) => {
+            return Err(ShimError::RuntimeError(format!(
+                "Failed to read from guest: {}",
+                e
+            )))
+        }
+    }
 
     let cmd = u16::from_le_bytes(cmd_buf);
     let (opcode, value) = decode_cmd(cmd);
@@ -277,9 +284,16 @@ fn process_guest_message(
         CMD_WRITE_STDOUT | CMD_WRITE_STDERR => {
             if value > 0 {
                 let mut data = vec![0u8; value];
-                remote.read_exact(&mut data).map_err(|e| {
-                    ShimError::RuntimeError(format!("Failed to read data from guest: {}", e))
-                })?;
+                match remote.read_exact(&mut data) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+                    Err(e) => {
+                        return Err(ShimError::RuntimeError(format!(
+                            "Failed to read data from guest: {}",
+                            e
+                        )))
+                    }
+                }
 
                 let target = if opcode == CMD_WRITE_STDOUT || is_tty {
                     &mut *stdout
@@ -473,9 +487,16 @@ fn process_guest_message_to_channel(
     use crate::types::OutputEvent;
 
     let mut cmd_buf = [0u8; 2];
-    remote
-        .read_exact(&mut cmd_buf)
-        .map_err(|e| ShimError::RuntimeError(format!("Failed to read from guest: {}", e)))?;
+    match remote.read_exact(&mut cmd_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+        Err(e) => {
+            return Err(ShimError::RuntimeError(format!(
+                "Failed to read from guest: {}",
+                e
+            )))
+        }
+    }
 
     let cmd = u16::from_le_bytes(cmd_buf);
     let (opcode, value) = decode_cmd(cmd);
@@ -484,9 +505,16 @@ fn process_guest_message_to_channel(
         CMD_WRITE_STDOUT | CMD_WRITE_STDERR => {
             if value > 0 {
                 let mut data = vec![0u8; value];
-                remote.read_exact(&mut data).map_err(|e| {
-                    ShimError::RuntimeError(format!("Failed to read data from guest: {}", e))
-                })?;
+                match remote.read_exact(&mut data) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(None),
+                    Err(e) => {
+                        return Err(ShimError::RuntimeError(format!(
+                            "Failed to read data from guest: {}",
+                            e
+                        )))
+                    }
+                }
 
                 let event = if opcode == CMD_WRITE_STDOUT || is_tty {
                     OutputEvent::Stdout(data)
