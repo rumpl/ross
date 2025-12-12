@@ -1,7 +1,9 @@
 use crate::error::ContainerError;
 use crate::types::*;
 use async_stream::stream;
-use ross_shim::{CreateContainerOpts, KrunShim, RuncShim, Shim};
+use ross_shim::{CreateContainerOpts, KrunShim, Shim};
+#[cfg(not(target_os = "macos"))]
+use ross_shim::RuncShim;
 use ross_snapshotter::OverlaySnapshotter;
 use ross_store::FileSystemStore;
 use std::collections::HashMap;
@@ -195,14 +197,6 @@ impl ContainerService {
             id,
             warnings: vec![],
         })
-    }
-
-    async fn get_image_top_layer(&self, image_ref: &str) -> Result<String, ContainerError> {
-        let image_config = self.get_image_config(image_ref).await?;
-
-        image_config
-            .top_layer
-            .ok_or_else(|| ContainerError::ImageNotFound("Image has no layers".to_string()))
     }
 
     async fn get_image_config(&self, image_ref: &str) -> Result<ImageConfigInfo, ContainerError> {
