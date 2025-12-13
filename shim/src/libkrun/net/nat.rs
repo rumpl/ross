@@ -6,25 +6,75 @@ use super::eth::{
 };
 use super::{GATEWAY_MAC, HOST_IP};
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
-// Max TCP payload we place in a single Ethernet+IPv4+TCP frame.
+/// Fast non-cryptographic hasher for internal NAT tables.
+/// Based on FxHash - much faster than SipHash for small keys like our NAT tuple.
+#[derive(Default)]
+struct FastHasher(u64);
+
+impl Hasher for FastHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self
+                .0
+                .wrapping_mul(0x517cc1b727220a95)
+                .wrapping_add(b as u64);
+        }
+    }
+
+    #[inline]
+    fn write_u16(&mut self, i: u16) {
+        self.0 = self
+            .0
+            .wrapping_mul(0x517cc1b727220a95)
+            .wrapping_add(i as u64);
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.0 = self
+            .0
+            .wrapping_mul(0x517cc1b727220a95)
+            .wrapping_add(i as u64);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type FastHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
+
+// Max TCP payload for non-TSO frames (standard MTU).
 // Keep IP total length <= 1500 (typical MTU): 1500 - 20 (IP) - 20 (TCP) = 1460.
 const MAX_SEGMENT_SIZE: usize = 1460;
-// Large read buffer for batching: read up to 64KB from host sockets at once,
-// then split into MSS-sized segments. This dramatically reduces syscall overhead.
+
+// TSO (TCP Segmentation Offload) segment size.
+// With virtio-net TSO enabled (GUEST_TSO4), we can send much larger segments
+// and the guest's network stack will handle segmentation. This dramatically
+// reduces per-packet overhead (fewer packets, fewer checksums, less header construction).
+// Max safe size: 65535 (IP max) - 20 (IP hdr) - 20 (TCP hdr) = 65495, but use 32KB for safety.
+const TSO_SEGMENT_SIZE: usize = 32 * 1024;
+
+// Large read buffer for batching: read up to 64KB from host sockets at once.
 const TCP_READ_BUFFER_SIZE: usize = 64 * 1024;
+
 // Upper bound for in-flight bytes to guest (we also gate on the guest's advertised window).
-// Keep this high to allow the TCP pipeline to stay full during high-throughput transfers.
-const TCP_INFLIGHT_CAP: u32 = 4 * 1024 * 1024; // 4MiB - allows ~2.7ms of data at 10Gbps
+// Keep this very high to allow the TCP pipeline to stay full during high-throughput transfers.
+// At 45 Gbits/sec, 16MB allows ~2.8ms of data in flight.
+const TCP_INFLIGHT_CAP: u32 = 16 * 1024 * 1024; // 16MiB
 const UDP_MAX_DATAGRAM: usize = 65535;
 const OUR_WSCALE: u8 = 7; // advertise 128x window scale to guest (~8MiB effective at 65535)
 
-// Socket buffer sizes for TCP connections
-const TCP_SOCKET_SNDBUF: i32 = 4 * 1024 * 1024; // 4MB send buffer
-const TCP_SOCKET_RCVBUF: i32 = 4 * 1024 * 1024; // 4MB receive buffer
+// Socket buffer sizes for TCP connections - use large buffers for high throughput
+const TCP_SOCKET_SNDBUF: i32 = 16 * 1024 * 1024; // 16MB send buffer
+const TCP_SOCKET_RCVBUF: i32 = 16 * 1024 * 1024; // 16MB receive buffer
 
 /// Translate destination IP if it's the special host IP.
 /// Returns (actual_ip, original_ip) where actual_ip is what we connect to
@@ -88,8 +138,8 @@ struct UdpNatEntry {
 
 /// NAT state.
 pub struct NatState {
-    tcp: HashMap<([u8; 4], u16, u16), TcpNatEntry>,
-    udp: HashMap<([u8; 4], u16, u16), UdpNatEntry>,
+    tcp: FastHashMap<([u8; 4], u16, u16), TcpNatEntry>,
+    udp: FastHashMap<([u8; 4], u16, u16), UdpNatEntry>,
     // Reusable scratch buffers to avoid per-poll/per-packet stack allocations.
     udp_rx_buf: Vec<u8>,
     // Large read buffer to batch reads from host sockets
@@ -100,8 +150,8 @@ pub struct NatState {
 impl NatState {
     pub fn new() -> Self {
         Self {
-            tcp: HashMap::new(),
-            udp: HashMap::new(),
+            tcp: FastHashMap::default(),
+            udp: FastHashMap::default(),
             udp_rx_buf: vec![0u8; UDP_MAX_DATAGRAM],
             tcp_rx_buf: vec![0u8; TCP_READ_BUFFER_SIZE],
             tcp_keys_scratch: Vec::with_capacity(64),
@@ -278,19 +328,6 @@ pub fn handle_tcp(
         [dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]],
         dst_port,
         src_port,
-    );
-
-    tracing::trace!(
-        src_port,
-        dst_port,
-        seq,
-        ack,
-        syn,
-        ack_flag,
-        fin,
-        rst,
-        data_len = data.len(),
-        "TCP rx"
     );
 
     if rst {
@@ -554,7 +591,7 @@ pub fn handle_tcp(
             }
         }
     } else if !data.is_empty() {
-        // Can't send but need to ACK guest data
+        // ACK guest data
         return build_tcp_packet(
             &entry.client_mac,
             &entry.client_ip,
@@ -643,7 +680,7 @@ fn handle_tcp_syn(
                     last_active: Instant::now(),
                     guest_window: 65535,
                     guest_wscale,
-                    write_buffer: Vec::new(),
+                    write_buffer: Vec::with_capacity(64 * 1024), // Pre-allocate for perf
                     write_offset: 0,
                 },
             );
@@ -737,6 +774,72 @@ fn build_tcp_packet(
     )
 }
 
+/// Build a TCP packet optimized for TSO (large segments).
+/// Uses pre-sized allocation and efficient construction.
+#[inline]
+fn build_tcp_packet_tso(
+    dst_mac: &[u8],
+    dst_ip: &[u8],
+    dst_port: u16,
+    src_port: u16,
+    src_ip: &[u8],
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    data: &[u8],
+) -> Option<Vec<u8>> {
+    let tcp_len = 20 + data.len();
+    let total_len = 14 + 20 + tcp_len;
+
+    // Pre-allocate exact size to avoid reallocation
+    let mut response = Vec::with_capacity(total_len);
+
+    // Ethernet header (14 bytes)
+    response.extend_from_slice(dst_mac);
+    response.extend_from_slice(&GATEWAY_MAC);
+    response.extend_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+
+    // IP header (20 bytes)
+    let ip_total_len = (20 + tcp_len) as u16;
+    response.push(0x45); // version + IHL
+    response.push(0); // DSCP + ECN
+    response.extend_from_slice(&ip_total_len.to_be_bytes());
+    response.extend_from_slice(&[0, 0]); // ID
+    response.extend_from_slice(&[0x40, 0]); // Don't fragment
+    response.push(64); // TTL
+    response.push(IP_PROTO_TCP);
+    let ip_cksum_pos = response.len();
+    response.extend_from_slice(&[0, 0]); // checksum placeholder
+    response.extend_from_slice(src_ip);
+    response.extend_from_slice(dst_ip);
+
+    // IP checksum
+    let ip_cksum = checksum(&response[14..34]);
+    response[ip_cksum_pos..ip_cksum_pos + 2].copy_from_slice(&ip_cksum.to_be_bytes());
+
+    // TCP header (20 bytes)
+    let tcp_start = response.len();
+    response.extend_from_slice(&src_port.to_be_bytes());
+    response.extend_from_slice(&dst_port.to_be_bytes());
+    response.extend_from_slice(&seq.to_be_bytes());
+    response.extend_from_slice(&ack.to_be_bytes());
+    response.push(5 << 4); // data offset (5 words = 20 bytes)
+    response.push(flags);
+    response.extend_from_slice(&(u16::MAX).to_be_bytes()); // window
+    let tcp_cksum_pos = response.len();
+    response.extend_from_slice(&[0, 0]); // checksum placeholder
+    response.extend_from_slice(&[0, 0]); // urgent pointer
+
+    // TCP payload
+    response.extend_from_slice(data);
+
+    // TCP checksum (compute over pseudo-header + TCP segment)
+    let tcp_cksum = tcp_udp_checksum(src_ip, dst_ip, IP_PROTO_TCP, &response[tcp_start..]);
+    response[tcp_cksum_pos..tcp_cksum_pos + 2].copy_from_slice(&tcp_cksum.to_be_bytes());
+
+    Some(response)
+}
+
 fn build_tcp_packet_with_options(
     dst_mac: &[u8],
     dst_ip: &[u8],
@@ -776,14 +879,6 @@ fn build_tcp_packet_with_options(
     let tcp_end = tcp_start + tcp_len;
     let cksum = tcp_udp_checksum(src_ip, dst_ip, IP_PROTO_TCP, &response[tcp_start..tcp_end]);
     response[tcp_start + 16..tcp_start + 18].copy_from_slice(&cksum.to_be_bytes());
-    tracing::trace!(
-        seq,
-        ack,
-        flags,
-        data_len = data.len(),
-        opt_len = options.len(),
-        "TCP tx"
-    );
     Some(response)
 }
 
@@ -930,15 +1025,16 @@ pub fn poll_nat_sockets(state: &mut NatState, responses: &mut Vec<Vec<u8>>) {
                     break 'read_loop;
                 }
                 Ok(total_len) => {
-                    // Split into MSS-sized segments for the guest
+                    // With TSO enabled, send large segments - the guest handles segmentation.
+                    // This reduces per-packet overhead dramatically.
                     let mut offset = 0;
                     while offset < total_len {
-                        let chunk_len = (total_len - offset).min(MAX_SEGMENT_SIZE);
+                        let chunk_len = (total_len - offset).min(TSO_SEGMENT_SIZE);
                         let chunk = &state.tcp_rx_buf[offset..offset + chunk_len];
 
                         if let Some(e) = state.tcp.get(&key) {
                             let seq = e.our_seq.wrapping_add(offset as u32);
-                            if let Some(resp) = build_tcp_packet(
+                            if let Some(resp) = build_tcp_packet_tso(
                                 &e.client_mac,
                                 &e.client_ip,
                                 e.client_port,

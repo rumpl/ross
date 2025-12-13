@@ -104,6 +104,9 @@ pub fn network_available() -> bool {
 }
 
 fn run_stack(fd: i32, shutdown: Arc<AtomicBool>) {
+    // Boost thread priority for lower latency networking
+    boost_thread_priority();
+
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
         libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
@@ -159,11 +162,11 @@ fn run_stack(fd: i32, shutdown: Arc<AtomicBool>) {
 }
 
 fn net_workers() -> usize {
-    // Opt-in: allow scaling across cores for high-throughput benchmarks (iperf).
-    // More workers generally means higher throughput but also higher CPU usage.
+    // Opt-in multi-worker mode for high-throughput networking.
+    // Default to single-threaded for maximum compatibility; set env var for more throughput.
     //
     // Example:
-    //   ROSS_NET_WORKERS=4 ross ...
+    //   ROSS_NET_WORKERS=4 ross ...   # 4 workers for better iperf throughput
     if let Ok(v) = std::env::var("ROSS_NET_WORKERS") {
         if let Ok(n) = v.parse::<usize>() {
             return n.max(1).min(32);
@@ -448,7 +451,7 @@ fn net_worker_loop_lockfree(
 fn tx_sender_loop_lockfree(fd: i32, tx_rings: Vec<Arc<SpscPacketRing>>, shutdown: Arc<AtomicBool>) {
     // Send directly from ring storage (no memcpy) and only poll when we hit EAGAIN.
     let mut idle_count = 0u32;
-    
+
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -595,17 +598,17 @@ fn flush_outbox_nowait(fd: i32, outbox: &mut VecDeque<Vec<u8>>) {
 #[cfg(target_os = "linux")]
 fn flush_outbox_sendmmsg(fd: i32, outbox: &mut VecDeque<Vec<u8>>) {
     const MAX_BATCH: usize = 64;
-    
+
     while !outbox.is_empty() {
         let batch_size = outbox.len().min(MAX_BATCH);
         if batch_size == 0 {
             break;
         }
-        
+
         // Build iovec and mmsghdr arrays
         let mut iovecs: [libc::iovec; MAX_BATCH] = unsafe { std::mem::zeroed() };
         let mut msghdrs: [libc::mmsghdr; MAX_BATCH] = unsafe { std::mem::zeroed() };
-        
+
         for (i, pkt) in outbox.iter().take(batch_size).enumerate() {
             iovecs[i] = libc::iovec {
                 iov_base: pkt.as_ptr() as *mut _,
@@ -614,11 +617,9 @@ fn flush_outbox_sendmmsg(fd: i32, outbox: &mut VecDeque<Vec<u8>>) {
             msghdrs[i].msg_hdr.msg_iov = &mut iovecs[i];
             msghdrs[i].msg_hdr.msg_iovlen = 1;
         }
-        
-        let sent = unsafe {
-            libc::sendmmsg(fd, msghdrs.as_mut_ptr(), batch_size as u32, 0)
-        };
-        
+
+        let sent = unsafe { libc::sendmmsg(fd, msghdrs.as_mut_ptr(), batch_size as u32, 0) };
+
         if sent <= 0 {
             let err = std::io::Error::last_os_error();
             if err.kind() == std::io::ErrorKind::WouldBlock {
@@ -628,7 +629,7 @@ fn flush_outbox_sendmmsg(fd: i32, outbox: &mut VecDeque<Vec<u8>>) {
             let _ = outbox.pop_front();
             break;
         }
-        
+
         // Remove sent packets
         for _ in 0..sent {
             let _ = outbox.pop_front();
@@ -730,5 +731,38 @@ fn process_ipv4(
         }
         IP_PROTO_TCP => handle_tcp(nat_state, ip_payload, src_mac, src_ip, dst_ip),
         _ => None,
+    }
+}
+
+/// Boost thread priority for lower latency networking.
+/// On macOS, uses pthread_setschedparam with SCHED_RR (round-robin real-time).
+fn boost_thread_priority() {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe {
+            let thread = libc::pthread_self();
+            let mut param: libc::sched_param = std::mem::zeroed();
+            // Use a high but not maximum priority (max is usually 47 on macOS)
+            param.sched_priority = 45;
+            let result = libc::pthread_setschedparam(thread, libc::SCHED_RR, &param);
+            if result != 0 {
+                // Fall back to SCHED_FIFO if RR fails
+                param.sched_priority = 45;
+                let _ = libc::pthread_setschedparam(thread, libc::SCHED_FIFO, &param);
+            }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        unsafe {
+            let thread = libc::pthread_self();
+            let mut param: libc::sched_param = std::mem::zeroed();
+            param.sched_priority = 50; // Mid-high priority
+            let result = libc::pthread_setschedparam(thread, libc::SCHED_RR, &param);
+            if result != 0 {
+                // If real-time fails (requires CAP_SYS_NICE), try nice value
+                libc::nice(-10);
+            }
+        }
     }
 }
