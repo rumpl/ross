@@ -10,8 +10,14 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
-const MAX_SEGMENT_SIZE: usize = 1400;
-const TCP_WINDOW: u32 = 65535;
+// Max TCP payload we place in a single Ethernet+IPv4+TCP frame.
+// Keep IP total length <= 1500 (typical MTU): 1500 - 20 (IP) - 20 (TCP) = 1460.
+const MAX_SEGMENT_SIZE: usize = 1460;
+// Upper bound for in-flight bytes to guest (we also gate on the guest's advertised window).
+// Keeping this higher than 64KiB helps when the guest uses window scaling.
+const TCP_INFLIGHT_CAP: u32 = 1024 * 1024; // 1MiB
+const UDP_MAX_DATAGRAM: usize = 65535;
+const OUR_WSCALE: u8 = 4; // advertise 16x window scale to guest (~1MiB effective at 65535)
 
 /// Translate destination IP if it's the special host IP.
 /// Returns (actual_ip, original_ip) where actual_ip is what we connect to
@@ -40,16 +46,27 @@ struct TcpNatEntry {
     acked_seq: u32,
     /// Next expected sequence number from guest
     expected_guest_seq: u32,
+    /// Guest advertised receive window (unscaled).
+    guest_window: u32,
+    /// Guest window scale shift (as announced in SYN).
+    guest_wscale: u8,
     last_active: Instant,
     /// Pending data to write to the remote server
     write_buffer: Vec<u8>,
+    write_offset: usize,
 }
 
 impl TcpNatEntry {
     fn can_send(&self) -> bool {
         // Simple flow control: only send if we haven't sent too much unacked data
         let unacked = self.our_seq.wrapping_sub(self.acked_seq);
-        unacked < TCP_WINDOW
+        // Guest's window field is scaled by the shift it announced in SYN.
+        let guest_adv = self
+            .guest_window
+            .checked_shl(self.guest_wscale as u32)
+            .unwrap_or(u32::MAX);
+        let limit = guest_adv.min(TCP_INFLIGHT_CAP);
+        unacked < limit
     }
 }
 
@@ -66,6 +83,10 @@ struct UdpNatEntry {
 pub struct NatState {
     tcp: HashMap<([u8; 4], u16, u16), TcpNatEntry>,
     udp: HashMap<([u8; 4], u16, u16), UdpNatEntry>,
+    // Reusable scratch buffers to avoid per-poll/per-packet stack allocations.
+    udp_rx_buf: Vec<u8>,
+    tcp_rx_buf: [u8; MAX_SEGMENT_SIZE],
+    tcp_keys_scratch: Vec<([u8; 4], u16, u16)>,
 }
 
 impl NatState {
@@ -73,6 +94,9 @@ impl NatState {
         Self {
             tcp: HashMap::new(),
             udp: HashMap::new(),
+            udp_rx_buf: vec![0u8; UDP_MAX_DATAGRAM],
+            tcp_rx_buf: [0u8; MAX_SEGMENT_SIZE],
+            tcp_keys_scratch: Vec::with_capacity(64),
         }
     }
 }
@@ -90,20 +114,30 @@ pub fn handle_icmp(
     build_icmp_reply(src_mac, src_ip, dst_ip, payload)
 }
 
-fn build_icmp_reply(dst_mac: &[u8], dst_ip: &[u8], src_ip: &[u8], request: &[u8]) -> Option<Vec<u8>> {
-    let mut icmp = request.to_vec();
-    icmp[0] = 0;
-    icmp[2..4].copy_from_slice(&[0, 0]);
-    let cksum = checksum(&icmp);
-    icmp[2..4].copy_from_slice(&cksum.to_be_bytes());
+fn build_icmp_reply(
+    dst_mac: &[u8],
+    dst_ip: &[u8],
+    src_ip: &[u8],
+    request: &[u8],
+) -> Option<Vec<u8>> {
+    let icmp_len = request.len();
+    let total_len = 14 + 20 + icmp_len;
 
-    let ip = build_ip_header(src_ip, dst_ip, IP_PROTO_ICMP, icmp.len(), 0);
     let eth = build_eth_header(dst_mac, &GATEWAY_MAC, ETHERTYPE_IPV4);
+    let ip = build_ip_header(src_ip, dst_ip, IP_PROTO_ICMP, icmp_len, 0);
 
-    let mut response = Vec::with_capacity(14 + 20 + icmp.len());
+    let mut response = Vec::with_capacity(total_len);
     response.extend_from_slice(&eth);
     response.extend_from_slice(&ip);
-    response.extend_from_slice(&icmp);
+    response.extend_from_slice(request);
+
+    // Flip echo request -> reply, recompute checksum in-place.
+    let icmp_start = 14 + 20;
+    response[icmp_start] = 0;
+    response[icmp_start + 2..icmp_start + 4].copy_from_slice(&[0, 0]);
+    let cksum = checksum(&response[icmp_start..icmp_start + icmp_len]);
+    response[icmp_start + 2..icmp_start + 4].copy_from_slice(&cksum.to_be_bytes());
+
     Some(response)
 }
 
@@ -150,12 +184,11 @@ pub fn handle_udp(
     entry.last_active = Instant::now();
     let _ = entry.socket.send(data);
 
-    let mut buf = [0u8; 65535];
-    if let Ok(len) = entry.socket.recv(&mut buf) {
+    if let Ok(len) = entry.socket.recv(&mut state.udp_rx_buf) {
         // Use original_ip in response so guest sees the IP it connected to
         return build_udp_response(
             &entry.client_mac, &entry.client_ip, entry.client_port,
-            dst_port, &original_ip, &buf[..len],
+            dst_port, &original_ip, &state.udp_rx_buf[..len],
         );
     }
     None
@@ -166,22 +199,25 @@ fn build_udp_response(
     src_port: u16, src_ip: &[u8], data: &[u8],
 ) -> Option<Vec<u8>> {
     let udp_len = 8 + data.len();
-    let mut udp = Vec::with_capacity(udp_len);
-    udp.extend_from_slice(&src_port.to_be_bytes());
-    udp.extend_from_slice(&dst_port.to_be_bytes());
-    udp.extend_from_slice(&(udp_len as u16).to_be_bytes());
-    udp.extend_from_slice(&[0, 0]);
-    udp.extend_from_slice(data);
-    let cksum = tcp_udp_checksum(src_ip, dst_ip, IP_PROTO_UDP, &udp);
-    udp[6..8].copy_from_slice(&cksum.to_be_bytes());
-
     let ip = build_ip_header(src_ip, dst_ip, IP_PROTO_UDP, udp_len, 0);
     let eth = build_eth_header(dst_mac, &GATEWAY_MAC, ETHERTYPE_IPV4);
 
     let mut response = Vec::with_capacity(14 + 20 + udp_len);
     response.extend_from_slice(&eth);
     response.extend_from_slice(&ip);
-    response.extend_from_slice(&udp);
+
+    // UDP header (checksum filled after payload copy).
+    response.extend_from_slice(&src_port.to_be_bytes());
+    response.extend_from_slice(&dst_port.to_be_bytes());
+    response.extend_from_slice(&(udp_len as u16).to_be_bytes());
+    response.extend_from_slice(&[0, 0]);
+    response.extend_from_slice(data);
+
+    let udp_start = 14 + 20;
+    let udp_end = udp_start + udp_len;
+    let cksum = tcp_udp_checksum(src_ip, dst_ip, IP_PROTO_UDP, &response[udp_start..udp_end]);
+    response[udp_start + 6..udp_start + 8].copy_from_slice(&cksum.to_be_bytes());
+
     Some(response)
 }
 
@@ -203,6 +239,7 @@ pub fn handle_tcp(
     let ack = u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
     let data_offset = ((payload[12] >> 4) * 4) as usize;
     let flags = payload[13];
+    let window = u16::from_be_bytes([payload[14], payload[15]]) as u32;
 
     let syn = flags & 0x02 != 0;
     let ack_flag = flags & 0x10 != 0;
@@ -225,11 +262,20 @@ pub fn handle_tcp(
 
     // SYN - new connection
     if syn && !ack_flag {
-        return handle_tcp_syn(state, key, src_mac, src_ip, dst_ip, src_port, dst_port, seq);
+        let opts = if data_offset > 20 && data_offset <= payload.len() {
+            &payload[20..data_offset]
+        } else {
+            &[]
+        };
+        return handle_tcp_syn(
+            state, key, src_mac, src_ip, dst_ip, src_port, dst_port, seq, opts,
+        );
     }
 
     let entry = state.tcp.get_mut(&key)?;
     entry.last_active = Instant::now();
+    // Track the guest advertised receive window (unscaled TCP header field).
+    entry.guest_window = window.max(1024); // clamp away pathological 0/1 windows
 
     // Update acked_seq from guest's ACK
     if ack_flag && ack > entry.acked_seq {
@@ -254,15 +300,57 @@ pub fn handle_tcp(
         );
     }
 
-    // Process data from guest - use non-blocking write
+    // Process data from guest.
+    // Fast path: if we have no pending buffered data, try to write directly to the remote stream
+    // to avoid an extra userspace copy into write_buffer.
     if !data.is_empty() {
-        entry.write_buffer.extend_from_slice(data);
+        if entry.write_offset == 0 && entry.write_buffer.is_empty() {
+            match entry.stream.write(data) {
+                Ok(0) => {
+                    let resp = build_tcp_packet(
+                        &entry.client_mac, &entry.client_ip, entry.client_port,
+                        entry.remote_port, &entry.remote_ip,
+                        0, 0, 0x04, &[],
+                    );
+                    state.tcp.remove(&key);
+                    return resp;
+                }
+                Ok(n) if n == data.len() => {
+                    // fully written, no buffering needed
+                }
+                Ok(n) => {
+                    entry.write_buffer.extend_from_slice(&data[n..]);
+                    entry.write_offset = 0;
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    entry.write_buffer.extend_from_slice(data);
+                    entry.write_offset = 0;
+                }
+                Err(e) => {
+                    tracing::debug!(error = %e, "TCP write failed");
+                    let resp = build_tcp_packet(
+                        &entry.client_mac, &entry.client_ip, entry.client_port,
+                        entry.remote_port, &entry.remote_ip,
+                        0, 0, 0x04, &[],
+                    );
+                    state.tcp.remove(&key);
+                    return resp;
+                }
+            }
+        } else {
+            // Slow path: buffer and flush.
+            if entry.write_offset >= entry.write_buffer.len() {
+                entry.write_buffer.clear();
+                entry.write_offset = 0;
+            }
+            entry.write_buffer.extend_from_slice(data);
+        }
         entry.expected_guest_seq = entry.expected_guest_seq.wrapping_add(data.len() as u32);
     }
 
     // Try to flush write buffer
-    if !entry.write_buffer.is_empty() {
-        match entry.stream.write(&entry.write_buffer) {
+    if entry.write_offset < entry.write_buffer.len() {
+        match entry.stream.write(&entry.write_buffer[entry.write_offset..]) {
             Ok(0) => {
                 // Connection closed
                 let resp = build_tcp_packet(
@@ -274,7 +362,14 @@ pub fn handle_tcp(
                 return resp;
             }
             Ok(n) => {
-                entry.write_buffer.drain(..n);
+                entry.write_offset = entry.write_offset.saturating_add(n);
+                // Occasionally compact to avoid unbounded growth if we append a lot.
+                if entry.write_offset > 64 * 1024 && entry.write_offset >= entry.write_buffer.len() / 2 {
+                    compact_write_buffer(entry);
+                } else if entry.write_offset >= entry.write_buffer.len() {
+                    entry.write_buffer.clear();
+                    entry.write_offset = 0;
+                }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // Can't write now, will retry later
@@ -306,8 +401,7 @@ pub fn handle_tcp(
 
     // Try to send data to guest if we have window space
     if entry.can_send() {
-        let mut buf = [0u8; MAX_SEGMENT_SIZE];
-        match entry.stream.read(&mut buf) {
+        match entry.stream.read(&mut state.tcp_rx_buf) {
             Ok(0) => {
                 let resp = build_tcp_packet(
                     &entry.client_mac, &entry.client_ip, entry.client_port,
@@ -321,7 +415,7 @@ pub fn handle_tcp(
                 let resp = build_tcp_packet(
                     &entry.client_mac, &entry.client_ip, entry.client_port,
                     entry.remote_port, &entry.remote_ip,
-                    entry.our_seq, entry.expected_guest_seq, 0x18, &buf[..len],
+                    entry.our_seq, entry.expected_guest_seq, 0x18, &state.tcp_rx_buf[..len],
                 );
                 entry.our_seq = entry.our_seq.wrapping_add(len as u32);
                 return resp;
@@ -367,7 +461,9 @@ fn handle_tcp_syn(
     src_port: u16,
     dst_port: u16,
     seq: u32,
+    syn_options: &[u8],
 ) -> Option<Vec<u8>> {
+    let guest_wscale = parse_tcp_wscale(syn_options).unwrap_or(0).min(14);
     // Translate HOST_IP to localhost
     let (actual_ip, original_ip) = translate_host_ip(dst_ip);
 
@@ -407,10 +503,22 @@ fn handle_tcp_syn(
                 acked_seq: our_seq, // Guest hasn't ACKed anything yet
                 expected_guest_seq,
                 last_active: Instant::now(),
+                guest_window: 65535,
+                guest_wscale,
                 write_buffer: Vec::new(),
+                write_offset: 0,
             });
 
-            build_tcp_packet(src_mac, src_ip, src_port, dst_port, &original_ip, our_seq, expected_guest_seq, 0x12, &[])
+            build_tcp_synack(
+                src_mac,
+                src_ip,
+                src_port,
+                dst_port,
+                &original_ip,
+                our_seq,
+                expected_guest_seq,
+                OUR_WSCALE,
+            )
         }
         Err(e) => {
             tracing::debug!(error = %e, "TCP connect failed");
@@ -419,67 +527,145 @@ fn handle_tcp_syn(
     }
 }
 
+fn build_tcp_synack(
+    dst_mac: &[u8],
+    dst_ip: &[u8],
+    dst_port: u16,
+    src_port: u16,
+    src_ip: &[u8],
+    seq: u32,
+    ack: u32,
+    our_wscale: u8,
+) -> Option<Vec<u8>> {
+    // TCP options: MSS (4) + WS (4 incl NOP padding) = 8 bytes.
+    // MSS=1460, NOP, WS=our_wscale, NOP padding.
+    let mut opts = [0u8; 8];
+    // MSS
+    opts[0] = 2;
+    opts[1] = 4;
+    opts[2..4].copy_from_slice(&(MAX_SEGMENT_SIZE as u16).to_be_bytes());
+    // NOP + WS
+    opts[4] = 1;
+    opts[5] = 3;
+    opts[6] = 3;
+    opts[7] = our_wscale;
+
+    build_tcp_packet_with_options(
+        dst_mac, dst_ip, dst_port, src_port, src_ip, seq, ack, 0x12, &opts, &[],
+    )
+}
+
 fn build_tcp_packet(
     dst_mac: &[u8], dst_ip: &[u8], dst_port: u16,
     src_port: u16, src_ip: &[u8],
     seq: u32, ack: u32, flags: u8, data: &[u8],
 ) -> Option<Vec<u8>> {
-    let tcp_len = 20 + data.len();
-    let mut tcp = vec![0u8; tcp_len];
+    build_tcp_packet_with_options(dst_mac, dst_ip, dst_port, src_port, src_ip, seq, ack, flags, &[], data)
+}
 
-    tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
-    tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
-    tcp[4..8].copy_from_slice(&seq.to_be_bytes());
-    tcp[8..12].copy_from_slice(&ack.to_be_bytes());
-    tcp[12] = 0x50;
-    tcp[13] = flags;
-    tcp[14..16].copy_from_slice(&(TCP_WINDOW as u16).to_be_bytes());
-    tcp[20..].copy_from_slice(data);
-
-    let cksum = tcp_udp_checksum(src_ip, dst_ip, IP_PROTO_TCP, &tcp);
-    tcp[16..18].copy_from_slice(&cksum.to_be_bytes());
-
+fn build_tcp_packet_with_options(
+    dst_mac: &[u8],
+    dst_ip: &[u8],
+    dst_port: u16,
+    src_port: u16,
+    src_ip: &[u8],
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    options: &[u8],
+    data: &[u8],
+) -> Option<Vec<u8>> {
+    debug_assert!(options.len() % 4 == 0);
+    let tcp_len = 20 + options.len() + data.len();
     let ip = build_ip_header(src_ip, dst_ip, IP_PROTO_TCP, tcp_len, 0);
     let eth = build_eth_header(dst_mac, &GATEWAY_MAC, ETHERTYPE_IPV4);
 
     let mut response = Vec::with_capacity(14 + 20 + tcp_len);
     response.extend_from_slice(&eth);
     response.extend_from_slice(&ip);
-    response.extend_from_slice(&tcp);
 
-    tracing::trace!(seq, ack, flags = format!("0x{:02x}", flags), data_len = data.len(), "TCP tx");
+    response.extend_from_slice(&src_port.to_be_bytes());
+    response.extend_from_slice(&dst_port.to_be_bytes());
+    response.extend_from_slice(&seq.to_be_bytes());
+    response.extend_from_slice(&ack.to_be_bytes());
+
+    let doff_words = ((20 + options.len()) / 4) as u8;
+    response.push(doff_words << 4);
+    response.push(flags);
+    response.extend_from_slice(&(u16::MAX).to_be_bytes());
+    response.extend_from_slice(&[0, 0]); // checksum placeholder
+    response.extend_from_slice(&[0, 0]); // urgent pointer
+    response.extend_from_slice(options);
+    response.extend_from_slice(data);
+
+    let tcp_start = 14 + 20;
+    let tcp_end = tcp_start + tcp_len;
+    let cksum = tcp_udp_checksum(src_ip, dst_ip, IP_PROTO_TCP, &response[tcp_start..tcp_end]);
+    response[tcp_start + 16..tcp_start + 18].copy_from_slice(&cksum.to_be_bytes());
+    tracing::trace!(seq, ack, flags, data_len = data.len(), opt_len = options.len(), "TCP tx");
     Some(response)
 }
 
+fn parse_tcp_wscale(options: &[u8]) -> Option<u8> {
+    let mut i = 0usize;
+    while i < options.len() {
+        let kind = options[i];
+        match kind {
+            0 => break, // EOL
+            1 => {
+                i += 1; // NOP
+                continue;
+            }
+            _ => {
+                if i + 1 >= options.len() {
+                    break;
+                }
+                let len = options[i + 1] as usize;
+                if len < 2 || i + len > options.len() {
+                    break;
+                }
+                if kind == 3 && len == 3 {
+                    return Some(options[i + 2]);
+                }
+                i += len;
+            }
+        }
+    }
+    None
+}
+
 /// Poll NAT sockets for incoming data.
-pub fn poll_nat_sockets(state: &mut NatState) -> Vec<Vec<u8>> {
-    let mut responses = Vec::new();
+pub fn poll_nat_sockets(state: &mut NatState, responses: &mut Vec<Vec<u8>>) {
+    responses.clear();
 
     // Poll UDP
-    let udp_keys: Vec<_> = state.udp.keys().cloned().collect();
-    for key in udp_keys {
-        if let Some(entry) = state.udp.get_mut(&key) {
-            let mut buf = [0u8; 65535];
-            while let Ok(len) = entry.socket.recv(&mut buf) {
-                if let Some(resp) = build_udp_response(
-                    &entry.client_mac, &entry.client_ip, entry.client_port,
-                    key.1, &key.0, &buf[..len],
-                ) {
-                    responses.push(resp);
-                }
+    for (key, entry) in state.udp.iter_mut() {
+        while let Ok(len) = entry.socket.recv(&mut state.udp_rx_buf) {
+            if let Some(resp) = build_udp_response(
+                &entry.client_mac,
+                &entry.client_ip,
+                entry.client_port,
+                key.1,
+                &key.0,
+                &state.udp_rx_buf[..len],
+            ) {
+                responses.push(resp);
             }
         }
     }
 
     // Poll TCP - send multiple packets per connection for better throughput
     const MAX_PACKETS_PER_CONN: usize = 16;
-    let tcp_keys: Vec<_> = state.tcp.keys().cloned().collect();
+    state.tcp_keys_scratch.clear();
+    state
+        .tcp_keys_scratch
+        .extend(state.tcp.keys().cloned());
     
-    for key in tcp_keys {
+    for key in state.tcp_keys_scratch.iter().cloned() {
         // First, try to flush any pending write buffer
         if let Some(entry) = state.tcp.get_mut(&key) {
-            if !entry.write_buffer.is_empty() {
-                match entry.stream.write(&entry.write_buffer) {
+            if entry.write_offset < entry.write_buffer.len() {
+                match entry.stream.write(&entry.write_buffer[entry.write_offset..]) {
                     Ok(0) => {
                         // Connection closed
                         if let Some(resp) = build_tcp_packet(
@@ -493,7 +679,13 @@ pub fn poll_nat_sockets(state: &mut NatState) -> Vec<Vec<u8>> {
                         continue;
                     }
                     Ok(n) => {
-                        entry.write_buffer.drain(..n);
+                        entry.write_offset = entry.write_offset.saturating_add(n);
+                        if entry.write_offset > 64 * 1024 && entry.write_offset >= entry.write_buffer.len() / 2 {
+                            compact_write_buffer(entry);
+                        } else if entry.write_offset >= entry.write_buffer.len() {
+                            entry.write_buffer.clear();
+                            entry.write_offset = 0;
+                        }
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(_) => {
@@ -523,8 +715,7 @@ pub fn poll_nat_sockets(state: &mut NatState) -> Vec<Vec<u8>> {
                 break;
             }
 
-            let mut buf = [0u8; MAX_SEGMENT_SIZE];
-            match entry.stream.read(&mut buf) {
+            match entry.stream.read(&mut state.tcp_rx_buf) {
                 Ok(0) => {
                     // Connection closed
                     if let Some(resp) = build_tcp_packet(
@@ -541,7 +732,7 @@ pub fn poll_nat_sockets(state: &mut NatState) -> Vec<Vec<u8>> {
                     if let Some(resp) = build_tcp_packet(
                         &entry.client_mac, &entry.client_ip, entry.client_port,
                         entry.remote_port, &entry.remote_ip,
-                        entry.our_seq, entry.expected_guest_seq, 0x18, &buf[..len],
+                        entry.our_seq, entry.expected_guest_seq, 0x18, &state.tcp_rx_buf[..len],
                     ) {
                         responses.push(resp);
                     }
@@ -575,6 +766,22 @@ pub fn poll_nat_sockets(state: &mut NatState) -> Vec<Vec<u8>> {
     let now = Instant::now();
     state.udp.retain(|_, e| now.duration_since(e.last_active) < Duration::from_secs(60));
     state.tcp.retain(|_, e| now.duration_since(e.last_active) < Duration::from_secs(300));
+}
 
-    responses
+#[inline]
+fn compact_write_buffer(entry: &mut TcpNatEntry) {
+    if entry.write_offset == 0 {
+        return;
+    }
+    if entry.write_offset >= entry.write_buffer.len() {
+        entry.write_buffer.clear();
+        entry.write_offset = 0;
+        return;
+    }
+    let remaining = entry.write_buffer.len() - entry.write_offset;
+    entry
+        .write_buffer
+        .copy_within(entry.write_offset.., 0);
+    entry.write_buffer.truncate(remaining);
+    entry.write_offset = 0;
 }

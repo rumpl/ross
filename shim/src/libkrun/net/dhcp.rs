@@ -23,15 +23,22 @@ pub fn handle_dhcp(payload: &[u8]) -> Option<Vec<u8>> {
 
     tracing::debug!(msg_type = msg_type, "DHCP request");
 
-    let dhcp = build_dhcp_response(payload, response_type);
-    let udp = build_udp_packet(67, 68, &dhcp);
-    let ip = build_ip_header(&GATEWAY_IP, &[255, 255, 255, 255], IP_PROTO_UDP, udp.len(), 0);
+    let mut dhcp = [0u8; 300];
+    let dhcp_len = build_dhcp_response(payload, response_type, &mut dhcp);
+
+    let udp_len = 8 + dhcp_len;
+    let ip = build_ip_header(&GATEWAY_IP, &[255, 255, 255, 255], IP_PROTO_UDP, udp_len, 0);
     let eth = build_eth_header(&[0xff; 6], &GATEWAY_MAC, ETHERTYPE_IPV4);
 
-    let mut response = Vec::with_capacity(14 + 20 + udp.len());
+    let mut response = Vec::with_capacity(14 + 20 + udp_len);
     response.extend_from_slice(&eth);
     response.extend_from_slice(&ip);
-    response.extend_from_slice(&udp);
+    // UDP header (checksum optional; left zero).
+    response.extend_from_slice(&67u16.to_be_bytes());
+    response.extend_from_slice(&68u16.to_be_bytes());
+    response.extend_from_slice(&(udp_len as u16).to_be_bytes());
+    response.extend_from_slice(&[0, 0]);
+    response.extend_from_slice(&dhcp[..dhcp_len]);
 
     tracing::info!(
         response = if response_type == 2 { "OFFER" } else { "ACK" },
@@ -65,68 +72,62 @@ fn find_dhcp_option(options: &[u8], opt_code: u8) -> Option<u8> {
     None
 }
 
-fn build_dhcp_response(request: &[u8], msg_type: u8) -> Vec<u8> {
-    let mut dhcp = vec![0u8; 300];
+fn build_dhcp_response(request: &[u8], msg_type: u8, out: &mut [u8; 300]) -> usize {
+    out.fill(0);
 
-    dhcp[0] = 2; // BOOTREPLY
-    dhcp[1] = 1; // Ethernet
-    dhcp[2] = 6; // MAC length
-    dhcp[4..8].copy_from_slice(&request[4..8]); // Transaction ID
-    dhcp[10..12].copy_from_slice(&[0x80, 0]);   // Broadcast flag
-    dhcp[16..20].copy_from_slice(&GUEST_IP);    // Your IP
-    dhcp[20..24].copy_from_slice(&GATEWAY_IP);  // Server IP
-    dhcp[28..34].copy_from_slice(&request[28..34]); // Client MAC
+    out[0] = 2; // BOOTREPLY
+    out[1] = 1; // Ethernet
+    out[2] = 6; // MAC length
+    out[4..8].copy_from_slice(&request[4..8]); // Transaction ID
+    out[10..12].copy_from_slice(&[0x80, 0]); // Broadcast flag
+    out[16..20].copy_from_slice(&GUEST_IP); // Your IP
+    out[20..24].copy_from_slice(&GATEWAY_IP); // Server IP
+    out[28..34].copy_from_slice(&request[28..34]); // Client MAC
 
     // Magic cookie
-    dhcp[236..240].copy_from_slice(&[99, 130, 83, 99]);
+    out[236..240].copy_from_slice(&[99, 130, 83, 99]);
 
     // Options
     let mut i = 240;
-    
+
     // Message type
-    dhcp[i] = 53; dhcp[i+1] = 1; dhcp[i+2] = msg_type;
+    out[i] = 53;
+    out[i + 1] = 1;
+    out[i + 2] = msg_type;
     i += 3;
 
     // Server identifier
-    dhcp[i] = 54; dhcp[i+1] = 4;
-    dhcp[i+2..i+6].copy_from_slice(&GATEWAY_IP);
+    out[i] = 54;
+    out[i + 1] = 4;
+    out[i + 2..i + 6].copy_from_slice(&GATEWAY_IP);
     i += 6;
 
     // Lease time (24h)
-    dhcp[i] = 51; dhcp[i+1] = 4;
-    dhcp[i+2..i+6].copy_from_slice(&86400u32.to_be_bytes());
+    out[i] = 51;
+    out[i + 1] = 4;
+    out[i + 2..i + 6].copy_from_slice(&86400u32.to_be_bytes());
     i += 6;
 
     // Subnet mask
-    dhcp[i] = 1; dhcp[i+1] = 4;
-    dhcp[i+2..i+6].copy_from_slice(&SUBNET_MASK);
+    out[i] = 1;
+    out[i + 1] = 4;
+    out[i + 2..i + 6].copy_from_slice(&SUBNET_MASK);
     i += 6;
 
     // Router
-    dhcp[i] = 3; dhcp[i+1] = 4;
-    dhcp[i+2..i+6].copy_from_slice(&GATEWAY_IP);
+    out[i] = 3;
+    out[i + 1] = 4;
+    out[i + 2..i + 6].copy_from_slice(&GATEWAY_IP);
     i += 6;
 
     // DNS
-    dhcp[i] = 6; dhcp[i+1] = 4;
-    dhcp[i+2..i+6].copy_from_slice(&GATEWAY_IP);
+    out[i] = 6;
+    out[i + 1] = 4;
+    out[i + 2..i + 6].copy_from_slice(&GATEWAY_IP);
     i += 6;
 
     // End
-    dhcp[i] = 255;
+    out[i] = 255;
     i += 1;
-
-    dhcp.truncate(i);
-    dhcp
-}
-
-fn build_udp_packet(src_port: u16, dst_port: u16, data: &[u8]) -> Vec<u8> {
-    let len = (8 + data.len()) as u16;
-    let mut udp = Vec::with_capacity(8 + data.len());
-    udp.extend_from_slice(&src_port.to_be_bytes());
-    udp.extend_from_slice(&dst_port.to_be_bytes());
-    udp.extend_from_slice(&len.to_be_bytes());
-    udp.extend_from_slice(&[0, 0]); // Checksum (optional)
-    udp.extend_from_slice(data);
-    udp
+    i
 }

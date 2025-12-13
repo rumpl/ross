@@ -1,17 +1,17 @@
 //! Main network stack implementation.
 
+use super::GATEWAY_IP;
 use super::arp::handle_arp;
 use super::dhcp::handle_dhcp;
-use super::dns::handle_dns;
+use super::dns::{DnsForwarder, handle_dns};
 use super::eth::{ETHERTYPE_ARP, ETHERTYPE_IPV4, IP_PROTO_ICMP, IP_PROTO_TCP, IP_PROTO_UDP};
-use super::nat::{handle_icmp, handle_tcp, handle_udp, poll_nat_sockets, NatState};
-use super::GATEWAY_IP;
+use super::nat::{NatState, handle_icmp, handle_tcp, handle_udp, poll_nat_sockets};
 use crate::ShimError;
-use nix::sys::socket::{bind, socket, AddressFamily, SockFlag, SockType, UnixAddr};
+use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, bind, socket};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
 const VFKIT_MAGIC: [u8; 4] = *b"VFKT";
@@ -29,8 +29,13 @@ impl VmNetwork {
         let socket_path = PathBuf::from(format!("/tmp/ross-net-{}.sock", container_id));
         let _ = std::fs::remove_file(&socket_path);
 
-        let server_fd = socket(AddressFamily::Unix, SockType::Datagram, SockFlag::empty(), None)
-            .map_err(|e| ShimError::RuntimeError(format!("socket: {}", e)))?;
+        let server_fd = socket(
+            AddressFamily::Unix,
+            SockType::Datagram,
+            SockFlag::empty(),
+            None,
+        )
+        .map_err(|e| ShimError::RuntimeError(format!("socket: {}", e)))?;
 
         // Increase receive buffer size to prevent drops during high throughput
         unsafe {
@@ -39,6 +44,18 @@ impl VmNetwork {
                 server_fd.as_raw_fd(),
                 libc::SOL_SOCKET,
                 libc::SO_RCVBUF,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+
+        // Also increase send buffer size to reduce backpressure during bursts.
+        unsafe {
+            let buf_size: libc::c_int = 4 * 1024 * 1024; // 4MB
+            libc::setsockopt(
+                server_fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
                 &buf_size as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
@@ -133,7 +150,9 @@ fn run_stack(fd: i32, shutdown: Arc<AtomicBool>) {
 
     // Main loop - prioritize draining VM packets to prevent TX queue stalls
     let mut nat_state = NatState::new();
-    let mut pending_responses: Vec<Vec<u8>> = Vec::new();
+    let mut dns_forwarder: Option<DnsForwarder> = None;
+    let mut pending_responses: Vec<Vec<u8>> = Vec::with_capacity(256);
+    let mut nat_responses: Vec<Vec<u8>> = Vec::with_capacity(256);
     let mut idle_count = 0u32;
 
     loop {
@@ -151,7 +170,7 @@ fn run_stack(fd: i32, shutdown: Arc<AtomicBool>) {
             if n > 0 {
                 received_any = true;
                 let n = n as usize;
-                if let Some(resp) = process_frame(&buf[..n], &mut nat_state) {
+                if let Some(resp) = process_frame(&buf[..n], &mut nat_state, &mut dns_forwarder) {
                     pending_responses.push(resp);
                 }
             } else if n < 0 {
@@ -177,9 +196,9 @@ fn run_stack(fd: i32, shutdown: Arc<AtomicBool>) {
         }
 
         // Phase 3: Poll NAT sockets for data from remote servers
-        let responses = poll_nat_sockets(&mut nat_state);
-        let sent_any = !responses.is_empty();
-        for resp in responses {
+        poll_nat_sockets(&mut nat_state, &mut nat_responses);
+        let sent_any = !nat_responses.is_empty();
+        for resp in nat_responses.drain(..) {
             send_packet(fd, &resp);
         }
 
@@ -204,7 +223,11 @@ fn send_packet(fd: i32, data: &[u8]) {
     }
 }
 
-fn process_frame(frame: &[u8], nat_state: &mut NatState) -> Option<Vec<u8>> {
+fn process_frame(
+    frame: &[u8],
+    nat_state: &mut NatState,
+    dns_forwarder: &mut Option<DnsForwarder>,
+) -> Option<Vec<u8>> {
     if frame.len() < 14 {
         return None;
     }
@@ -215,12 +238,17 @@ fn process_frame(frame: &[u8], nat_state: &mut NatState) -> Option<Vec<u8>> {
 
     match ethertype {
         ETHERTYPE_ARP => handle_arp(payload, src_mac),
-        ETHERTYPE_IPV4 => process_ipv4(payload, src_mac, nat_state),
+        ETHERTYPE_IPV4 => process_ipv4(payload, src_mac, nat_state, dns_forwarder),
         _ => None,
     }
 }
 
-fn process_ipv4(payload: &[u8], src_mac: &[u8], nat_state: &mut NatState) -> Option<Vec<u8>> {
+fn process_ipv4(
+    payload: &[u8],
+    src_mac: &[u8],
+    nat_state: &mut NatState,
+    dns_forwarder: &mut Option<DnsForwarder>,
+) -> Option<Vec<u8>> {
     if payload.len() < 20 {
         return None;
     }
@@ -243,7 +271,7 @@ fn process_ipv4(payload: &[u8], src_mac: &[u8], nat_state: &mut NatState) -> Opt
                 handle_dhcp(&ip_payload[8..])
             } else if dst_port == 53 && dst_ip == GATEWAY_IP {
                 let src_port = u16::from_be_bytes([ip_payload[0], ip_payload[1]]);
-                handle_dns(&ip_payload[8..], src_mac, src_ip, src_port)
+                handle_dns(&ip_payload[8..], src_mac, src_ip, src_port, dns_forwarder)
             } else {
                 handle_udp(nat_state, ip_payload, src_mac, src_ip, dst_ip)
             }

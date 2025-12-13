@@ -6,6 +6,37 @@ use std::net::{SocketAddr, UdpSocket};
 use std::time::Duration;
 
 const ROSS_HOST_INTERNAL: &str = "ross.host.internal";
+const DEFAULT_DNS_SERVER: &str = "8.8.8.8:53";
+
+/// Persistent UDP socket for forwarding DNS queries.
+///
+/// Creating/binding sockets per DNS packet is extremely expensive; keeping a single
+/// connected socket avoids repeated syscalls and kernel allocations.
+pub struct DnsForwarder {
+    socket: UdpSocket,
+}
+
+impl DnsForwarder {
+    pub fn new() -> Option<Self> {
+        let dns_server: SocketAddr = DEFAULT_DNS_SERVER.parse().ok()?;
+        let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+        // A connected UDP socket avoids specifying the destination on every send.
+        socket.connect(dns_server).ok()?;
+        socket.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        Some(Self { socket })
+    }
+
+    #[inline]
+    fn send_query(&self, query: &[u8]) -> bool {
+        self.socket.send(query).is_ok()
+    }
+
+    #[inline]
+    fn recv_response<'a>(&self, buf: &'a mut [u8]) -> Option<&'a [u8]> {
+        let len = self.socket.recv(buf).ok()?;
+        Some(&buf[..len])
+    }
+}
 
 /// Handle DNS query by forwarding to upstream or resolving special hostnames.
 pub fn handle_dns(
@@ -13,64 +44,86 @@ pub fn handle_dns(
     client_mac: &[u8],
     client_ip: &[u8],
     client_port: u16,
+    forwarder: &mut Option<DnsForwarder>,
 ) -> Option<Vec<u8>> {
     if query.len() < 12 {
         return None;
     }
 
     // Check if this is a query for ross.host.internal
-    if let Some(name) = parse_dns_query_name(query)
-        && name.eq_ignore_ascii_case(ROSS_HOST_INTERNAL)
-    {
-        tracing::debug!(name = %name, "Resolving special hostname to host IP");
+    if is_query_for_ross_host_internal(query) {
+        tracing::debug!(name = ROSS_HOST_INTERNAL, "Resolving special hostname to host IP");
         if let Some(response) = build_dns_response(query, &HOST_IP) {
             return build_udp_response(client_mac, client_ip, client_port, 53, &response);
         }
     }
 
     // Forward to upstream DNS
-    let dns_server: SocketAddr = "8.8.8.8:53".parse().ok()?;
-    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
-    socket.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
-    socket.send_to(query, dns_server).ok()?;
+    if forwarder.is_none() {
+        *forwarder = DnsForwarder::new();
+    }
+
+    let fwd = forwarder.as_ref()?;
+    if !fwd.send_query(query) {
+        return None;
+    }
 
     let mut buf = [0u8; 512];
-    let (len, _) = socket.recv_from(&mut buf).ok()?;
-    let response = &buf[..len];
+    let response = fwd.recv_response(&mut buf)?;
 
-    tracing::debug!(len = len, "DNS response");
+    tracing::debug!(len = response.len(), "DNS response");
 
     build_udp_response(client_mac, client_ip, client_port, 53, response)
 }
 
-/// Parse the query name from a DNS query packet.
-fn parse_dns_query_name(query: &[u8]) -> Option<String> {
-    if query.len() < 12 {
-        return None;
+#[inline]
+fn eq_ascii_case_insensitive(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
     }
+    a.iter().zip(b.iter()).all(|(&x, &y)| x.to_ascii_lowercase() == y.to_ascii_lowercase())
+}
 
-    // DNS header is 12 bytes, question section starts after
-    let mut pos = 12;
-    let mut name_parts = Vec::new();
+/// Fast path: check if the first DNS question name matches `ross.host.internal`
+/// without allocating.
+fn is_query_for_ross_host_internal(query: &[u8]) -> bool {
+    const LABELS: [&[u8]; 3] = [b"ross", b"host", b"internal"];
+
+    // DNS header is 12 bytes, question section starts after.
+    let mut pos = 12usize;
+    let mut label_idx = 0usize;
 
     while pos < query.len() {
         let len = query[pos] as usize;
+        pos += 1;
+
         if len == 0 {
-            break;
+            // End of QNAME. Must have matched exactly 3 labels.
+            return label_idx == LABELS.len();
         }
-        if pos + 1 + len > query.len() {
-            return None;
+
+        // Compression pointers in QNAME aren't expected in queries we originate; bail out.
+        if len & 0b1100_0000 != 0 {
+            return false;
         }
-        let label = std::str::from_utf8(&query[pos + 1..pos + 1 + len]).ok()?;
-        name_parts.push(label.to_string());
-        pos += 1 + len;
+
+        if pos + len > query.len() {
+            return false;
+        }
+
+        if label_idx >= LABELS.len() {
+            return false;
+        }
+
+        if !eq_ascii_case_insensitive(&query[pos..pos + len], LABELS[label_idx]) {
+            return false;
+        }
+
+        pos += len;
+        label_idx += 1;
     }
 
-    if name_parts.is_empty() {
-        return None;
-    }
-
-    Some(name_parts.join("."))
+    false
 }
 
 /// Build a DNS response for an A record query.
@@ -136,23 +189,28 @@ fn build_udp_response(
     data: &[u8],
 ) -> Option<Vec<u8>> {
     let udp_len = 8 + data.len();
-    let mut udp = Vec::with_capacity(udp_len);
-    udp.extend_from_slice(&src_port.to_be_bytes());
-    udp.extend_from_slice(&dst_port.to_be_bytes());
-    udp.extend_from_slice(&(udp_len as u16).to_be_bytes());
-    udp.extend_from_slice(&[0, 0]); // Checksum placeholder
-    udp.extend_from_slice(data);
+    let total_len = 14 + 20 + udp_len;
 
-    let cksum = tcp_udp_checksum(&GATEWAY_IP, dst_ip, IP_PROTO_UDP, &udp);
-    udp[6..8].copy_from_slice(&cksum.to_be_bytes());
-
-    let ip = build_ip_header(&GATEWAY_IP, dst_ip, IP_PROTO_UDP, udp_len, 0);
     let eth = build_eth_header(dst_mac, &GATEWAY_MAC, ETHERTYPE_IPV4);
+    let ip = build_ip_header(&GATEWAY_IP, dst_ip, IP_PROTO_UDP, udp_len, 0);
 
-    let mut response = Vec::with_capacity(14 + 20 + udp_len);
+    let mut response = Vec::with_capacity(total_len);
     response.extend_from_slice(&eth);
     response.extend_from_slice(&ip);
-    response.extend_from_slice(&udp);
+
+    // UDP header (checksum filled after payload copy).
+    response.extend_from_slice(&src_port.to_be_bytes());
+    response.extend_from_slice(&dst_port.to_be_bytes());
+    response.extend_from_slice(&(udp_len as u16).to_be_bytes());
+    response.extend_from_slice(&[0, 0]);
+
+    response.extend_from_slice(data);
+
+    // Compute UDP checksum over the UDP segment we just appended.
+    let udp_start = 14 + 20;
+    let udp_end = udp_start + udp_len;
+    let cksum = tcp_udp_checksum(&GATEWAY_IP, dst_ip, IP_PROTO_UDP, &response[udp_start..udp_end]);
+    response[udp_start + 6..udp_start + 8].copy_from_slice(&cksum.to_be_bytes());
 
     Some(response)
 }
