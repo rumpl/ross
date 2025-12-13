@@ -5,6 +5,16 @@
 
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeMount {
+    /// virtio-fs tag configured by the host (libkrun).
+    pub tag: String,
+    /// Absolute path inside the guest/container where this volume should be mounted.
+    pub target: String,
+    #[serde(default)]
+    pub read_only: bool,
+}
+
 /// Configuration passed from host to guest via command-line JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GuestConfig {
@@ -16,4 +26,6 @@ pub struct GuestConfig {
     #[serde(default)]
     pub tty: bool,
     pub vsock_port: u32,
+    #[serde(default)]
+    pub volumes: Vec<VolumeMount>,
 }

@@ -7,6 +7,8 @@ mod dhcp;
 mod dns;
 mod eth;
 mod nat;
+mod ring;
+mod ring_spsc;
 mod stack;
 
 pub use stack::{VmNetwork, network_available};

@@ -15,6 +15,48 @@ use tokio::fs;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
+#[cfg(all(feature = "libkrun", target_os = "macos"))]
+fn parse_bind_spec(spec: &str) -> Result<(String, String, bool), ShimError> {
+    // Format: host_path:guest_path[:options]
+    // Options is a comma-separated list. We only interpret "ro" for now.
+    let parts: Vec<&str> = spec.splitn(3, ':').collect();
+    if parts.len() < 2 {
+        return Err(ShimError::RuntimeError(format!(
+            "Invalid volume spec '{}', expected HOST_PATH:GUEST_PATH[:OPTIONS]",
+            spec
+        )));
+    }
+
+    let host_path = parts[0].to_string();
+    let guest_path = parts[1].to_string();
+    if !guest_path.starts_with('/') {
+        return Err(ShimError::RuntimeError(format!(
+            "Invalid volume spec '{}': guest path must be absolute",
+            spec
+        )));
+    }
+
+    let read_only = parts
+        .get(2)
+        .map(|opts| opts.split(',').any(|o| o.trim() == "ro"))
+        .unwrap_or(false);
+
+    Ok((host_path, guest_path, read_only))
+}
+
+#[cfg(all(feature = "libkrun", target_os = "macos"))]
+fn vsock_port_for_container(container_id: &str) -> u32 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    // Pick a stable port in a high range, derived from the container id, to avoid collisions
+    // when multiple containers run concurrently.
+    let mut h = DefaultHasher::new();
+    container_id.hash(&mut h);
+    let v = h.finish() % 10_000; // 0..9999
+    50_000 + v as u32
+}
+
 pub struct KrunShim {
     data_dir: PathBuf,
     containers: Arc<RwLock<HashMap<String, ContainerMetadata>>>,
@@ -283,13 +325,15 @@ impl Shim for KrunShim {
         #[cfg(all(feature = "libkrun", target_os = "macos"))]
         {
             use super::krun;
-            use std::os::unix::io::FromRawFd;
+            use crate::guest_config::{GuestConfig, VolumeMount};
+            use crate::tty_host;
+            use std::os::unix::net::UnixListener;
 
             let containers = self.containers.clone();
             let data_dir = self.data_dir.clone();
 
             Box::pin(async_stream::try_stream! {
-                let (config, rootfs_path): (ContainerConfig, PathBuf);
+                let (config, rootfs_path, host_config): (ContainerConfig, PathBuf, HostConfig);
                 {
                     let mut containers_guard = containers.write().await;
                     let metadata = containers_guard
@@ -305,55 +349,69 @@ impl Shim for KrunShim {
 
                     config = metadata.config.clone();
                     rootfs_path = PathBuf::from(&metadata.info.rootfs_path);
+                    host_config = metadata.host_config.clone();
 
                     metadata.info.state = ContainerState::Running;
                     metadata.info.started_at = Some(KrunShim::current_timestamp());
                     metadata.save(&data_dir.join("containers").join(&id)).await?;
                 }
 
-                tracing::info!(container_id = %id, rootfs = ?rootfs_path, "Starting container with libkrun (streaming)");
+                tracing::info!(container_id = %id, rootfs = ?rootfs_path, "Starting container with libkrun (streaming via ross-init)");
 
                 krun::fix_root_mode(&rootfs_path);
 
-                let (exec_path, argv) = if !config.entrypoint.is_empty() {
-                    let mut args = config.entrypoint.clone();
+                // Allocate a vsock port for communication (non-tty still uses vsock for stdout/stderr/exit)
+                let vsock_port = vsock_port_for_container(&id);
+                let socket_path = krun::get_vsock_socket_path(vsock_port);
+
+                let _ = std::fs::remove_file(&socket_path);
+                let listener = UnixListener::bind(&socket_path).map_err(|e| {
+                    ShimError::RuntimeError(format!("Failed to bind vsock socket: {}", e))
+                })?;
+
+                let (command, args) = if !config.entrypoint.is_empty() {
+                    let mut args = config.entrypoint[1..].to_vec();
                     args.extend(config.cmd.clone());
                     (config.entrypoint[0].clone(), args)
                 } else if !config.cmd.is_empty() {
-                    (config.cmd[0].clone(), config.cmd.clone())
+                    (config.cmd[0].clone(), config.cmd[1..].to_vec())
                 } else {
-                    ("/bin/sh".to_string(), vec!["/bin/sh".to_string()])
+                    ("/bin/sh".to_string(), vec![])
                 };
 
-                let workdir = config.working_dir.as_deref();
+                let mut volumes: Vec<VolumeMount> = Vec::new();
+                let mut virtiofs_shares: Vec<(String, String)> = Vec::new();
+                for (idx, bind) in host_config.binds.iter().enumerate() {
+                    let (host_path, guest_path, read_only) = parse_bind_spec(bind)?;
+                    // virtio-fs tag must be unique
+                    let tag = format!("rossvol{}", idx);
+                    volumes.push(VolumeMount { tag: tag.clone(), target: guest_path, read_only });
+                    virtiofs_shares.push((tag, host_path));
+                }
 
-                let (stdout_fd, child_pid) = krun::fork_and_run_vm(
+                let guest_config = GuestConfig {
+                    command,
+                    args,
+                    env: config.env.clone(),
+                    workdir: config.working_dir.clone(),
+                    tty: false,
+                    vsock_port,
+                    volumes,
+                };
+
+                let child_pid = krun::fork_and_run_vm_interactive_with_network_and_shares(
                     &rootfs_path,
-                    &exec_path,
-                    &argv,
-                    &config.env,
-                    workdir,
+                    &guest_config,
+                    vsock_port,
+                    None,
+                    &virtiofs_shares,
                 )?;
 
-                let stdout_file = unsafe { std::fs::File::from_raw_fd(stdout_fd) };
-                let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(32);
-
-                std::thread::spawn(move || {
-                    use std::io::Read;
-                    let mut reader = std::io::BufReader::new(stdout_file);
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        match reader.get_mut().read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(n) => {
-                                if output_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                                    break;
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                });
+                // Create std::sync channels for the blocking I/O loop
+                // Keep the sender alive so the receiver doesn't disconnect immediately.
+                let (_sync_input_tx_keepalive, sync_input_rx) =
+                    std::sync::mpsc::channel::<InputEvent>();
+                let (sync_output_tx, sync_output_rx) = std::sync::mpsc::channel::<OutputEvent>();
 
                 let containers_for_wait = containers.clone();
                 let id_for_wait = id.clone();
@@ -378,24 +436,25 @@ impl Shim for KrunShim {
                     });
                 });
 
-                while let Some(data) = output_rx.recv().await {
-                    yield OutputEvent::Stdout(data);
-                }
+                // Spawn a forwarder from std output channel to stream yields
+                let (tokio_out_tx, mut tokio_out_rx) = tokio::sync::mpsc::channel::<OutputEvent>(64);
 
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-                let exit_code = {
-                    let containers_guard = containers.read().await;
-                    containers_guard
-                        .get(&id)
-                        .and_then(|m| m.info.exit_code)
-                        .unwrap_or(0)
-                };
-
-                yield OutputEvent::Exit(WaitResult {
-                    exit_code,
-                    error: None,
+                std::thread::spawn(move || {
+                    while let Ok(ev) = sync_output_rx.recv() {
+                        if tokio_out_tx.blocking_send(ev).is_err() {
+                            break;
+                        }
+                    }
                 });
+
+                // Run host I/O loop (blocking) that reads vsock and emits OutputEvents
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = tty_host::run_io_host_with_channels(listener, false, sync_input_rx, sync_output_tx);
+                });
+
+                while let Some(ev) = tokio_out_rx.recv().await {
+                    yield ev;
+                }
             })
         }
 
@@ -414,7 +473,7 @@ impl Shim for KrunShim {
     async fn run_interactive(
         &self,
         id: String,
-        mut input_rx: tokio::sync::mpsc::Receiver<InputEvent>,
+        input_rx: tokio::sync::mpsc::Receiver<InputEvent>,
         output_tx: tokio::sync::mpsc::Sender<OutputEvent>,
     ) -> Result<(), ShimError> {
         #[cfg(all(feature = "libkrun", target_os = "macos"))]
@@ -422,10 +481,13 @@ impl Shim for KrunShim {
             use super::krun::{self, NetworkConfig};
             use super::net::{DEFAULT_MAC, VmNetwork, network_available};
             use crate::guest_config::GuestConfig;
+            use crate::guest_config::VolumeMount;
             use crate::tty_host;
             use std::os::unix::net::UnixListener;
 
-            let (config, rootfs_path): (ContainerConfig, PathBuf);
+            let input_rx = input_rx;
+
+            let (config, rootfs_path, host_config): (ContainerConfig, PathBuf, HostConfig);
             {
                 let mut containers = self.containers.write().await;
                 let metadata = containers
@@ -441,6 +503,7 @@ impl Shim for KrunShim {
 
                 config = metadata.config.clone();
                 rootfs_path = PathBuf::from(&metadata.info.rootfs_path);
+                host_config = metadata.host_config.clone();
 
                 metadata.info.state = ContainerState::Running;
                 metadata.info.started_at = Some(Self::current_timestamp());
@@ -462,7 +525,7 @@ impl Shim for KrunShim {
             };
 
             // Allocate a vsock port for communication
-            let vsock_port = 50000 + (std::process::id() % 1000);
+            let vsock_port = vsock_port_for_container(&id);
             let socket_path = krun::get_vsock_socket_path(vsock_port);
 
             // Remove old socket if it exists
@@ -473,6 +536,19 @@ impl Shim for KrunShim {
                 ShimError::RuntimeError(format!("Failed to bind vsock socket: {}", e))
             })?;
 
+            let mut volumes: Vec<VolumeMount> = Vec::new();
+            let mut virtiofs_shares: Vec<(String, String)> = Vec::new();
+            for (idx, bind) in host_config.binds.iter().enumerate() {
+                let (host_path, guest_path, read_only) = parse_bind_spec(bind)?;
+                let tag = format!("rossvol{}", idx);
+                volumes.push(VolumeMount {
+                    tag: tag.clone(),
+                    target: guest_path,
+                    read_only,
+                });
+                virtiofs_shares.push((tag, host_path));
+            }
+
             let guest_config = GuestConfig {
                 command,
                 args,
@@ -480,6 +556,7 @@ impl Shim for KrunShim {
                 workdir: config.working_dir.clone(),
                 tty: config.tty,
                 vsock_port,
+                volumes,
             };
 
             // Start userspace network stack if available
@@ -506,11 +583,12 @@ impl Shim for KrunShim {
             });
 
             // Fork and start VM
-            let child_pid = krun::fork_and_run_vm_interactive_with_network(
+            let child_pid = krun::fork_and_run_vm_interactive_with_network_and_shares(
                 &rootfs_path,
                 &guest_config,
                 vsock_port,
                 network_config,
+                &virtiofs_shares,
             )?;
 
             let is_tty = config.tty;
@@ -524,6 +602,7 @@ impl Shim for KrunShim {
 
             // Spawn task to forward from tokio channel to std channel
             let input_forwarder = tokio::spawn(async move {
+                let mut input_rx = input_rx;
                 while let Some(event) = input_rx.recv().await {
                     if sync_input_tx.send(event).is_err() {
                         break;

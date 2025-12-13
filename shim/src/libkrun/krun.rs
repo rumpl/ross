@@ -84,7 +84,7 @@ pub fn fork_and_run_vm(
             libc::close(stdout_pipe[1]);
         }
 
-        run_vm_inner(rootfs_path, exec_path, argv, env, workdir, None, None);
+        run_vm_inner(rootfs_path, exec_path, argv, env, workdir, None, None, &[]);
     }
 
     unsafe {
@@ -113,6 +113,24 @@ pub fn fork_and_run_vm_interactive_with_network(
     vsock_port: u32,
     network_config: Option<NetworkConfig>,
 ) -> Result<libc::pid_t, ShimError> {
+    fork_and_run_vm_interactive_with_network_and_shares(
+        rootfs_path,
+        guest_config,
+        vsock_port,
+        network_config,
+        &[],
+    )
+}
+
+/// Fork and run VM with vsock for interactive I/O, optional network config, and extra virtio-fs shares.
+/// `virtiofs_shares` is a list of (tag, host_path).
+pub fn fork_and_run_vm_interactive_with_network_and_shares(
+    rootfs_path: &Path,
+    guest_config: &GuestConfig,
+    vsock_port: u32,
+    network_config: Option<NetworkConfig>,
+    virtiofs_shares: &[(String, String)],
+) -> Result<libc::pid_t, ShimError> {
     // Compute socket path before fork so both parent and child use the same path
     let socket_path = get_vsock_socket_path(vsock_port);
 
@@ -121,21 +139,15 @@ pub fn fork_and_run_vm_interactive_with_network(
         .map_err(|e| ShimError::RuntimeError(format!("Failed to serialize config: {}", e)))?;
     let config_path = rootfs_path.join(".ross-config.json");
 
-    tracing::debug!(config_path = %config_path.display(), config_len = config_json.len(), "Writing guest config file");
+    tracing::debug!(
+        config_path = %config_path.display(),
+        config_len = config_json.len(),
+        "Writing guest config file"
+    );
     tracing::trace!(config = %config_json, "Guest config contents");
 
     std::fs::write(&config_path, &config_json)
         .map_err(|e| ShimError::RuntimeError(format!("Failed to write config file: {}", e)))?;
-
-    // Verify the file was written
-    match std::fs::read_to_string(&config_path) {
-        Ok(contents) => {
-            tracing::debug!(read_len = contents.len(), "Verified config file written");
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to verify config file");
-        }
-    }
 
     let pid = unsafe { libc::fork() };
 
@@ -156,6 +168,7 @@ pub fn fork_and_run_vm_interactive_with_network(
             guest_config.workdir.as_deref(),
             Some((vsock_port, socket_path)),
             network_config,
+            virtiofs_shares,
         );
     }
 
@@ -170,6 +183,7 @@ fn run_vm_inner(
     workdir: Option<&str>,
     vsock_config: Option<(u32, String)>,
     network_config: Option<NetworkConfig>,
+    virtiofs_shares: &[(String, String)],
 ) -> ! {
     set_rlimits();
 
@@ -189,6 +203,19 @@ fn run_vm_inner(
     if unsafe { krun_sys::krun_set_root(ctx_id, root_cstr.as_ptr()) } < 0 {
         eprintln!("Failed to set root");
         std::process::exit(1);
+    }
+
+    for (tag, host_path) in virtiofs_shares {
+        if tag.is_empty() || host_path.is_empty() {
+            continue;
+        }
+        let tag_cstr = CString::new(tag.as_bytes()).unwrap();
+        let path_cstr = CString::new(host_path.as_bytes()).unwrap();
+        let ret = unsafe { krun_sys::krun_add_virtiofs(ctx_id, tag_cstr.as_ptr(), path_cstr.as_ptr()) };
+        if ret < 0 {
+            eprintln!("Failed to add virtiofs share {} -> {}: {}", tag, host_path, ret);
+            std::process::exit(1);
+        }
     }
 
     if let Some(wd) = workdir {

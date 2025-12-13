@@ -14,6 +14,67 @@ use std::process::ExitCode;
 
 const CONFIG_FILE_PATH: &str = "/.ross-config.json";
 
+#[cfg(target_os = "linux")]
+fn mount_volumes(config: &GuestConfig) -> ExitCode {
+    use nix::mount::{mount, MsFlags};
+
+    for v in &config.volumes {
+        if v.tag.is_empty() || v.target.is_empty() {
+            eprintln!("ross-init: skipping invalid volume entry: {:?}", v);
+            continue;
+        }
+        if !v.target.starts_with('/') {
+            eprintln!("ross-init: volume target must be absolute: {}", v.target);
+            return ExitCode::from(1);
+        }
+
+        if let Err(e) = std::fs::create_dir_all(&v.target) {
+            eprintln!("ross-init: failed to create mountpoint {}: {}", v.target, e);
+            return ExitCode::from(1);
+        }
+
+        let mut flags = MsFlags::MS_NOSUID | MsFlags::MS_NODEV;
+        if v.read_only {
+            flags |= MsFlags::MS_RDONLY;
+        }
+
+        if let Err(e) = mount(
+            Some(v.tag.as_str()),
+            v.target.as_str(),
+            Some("virtiofs"),
+            flags,
+            None::<&str>,
+        ) {
+            eprintln!(
+                "ross-init: failed to mount virtiofs tag '{}' at '{}': {}",
+                v.tag, v.target, e
+            );
+            return ExitCode::from(1);
+        }
+
+        eprintln!(
+            "ross-init: mounted volume tag '{}' at '{}'{}",
+            v.tag,
+            v.target,
+            if v.read_only { " (ro)" } else { "" }
+        );
+    }
+    ExitCode::from(0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_volumes(config: &GuestConfig) -> ExitCode {
+    // `ross-init` is meant to run inside the Linux guest. When we compile/test
+    // this crate on the host (e.g. macOS), we just no-op unless volumes were
+    // requested (which would indicate a misconfiguration).
+    if config.volumes.is_empty() {
+        ExitCode::from(0)
+    } else {
+        eprintln!("ross-init: volume mounts are only supported on Linux guests");
+        ExitCode::from(1)
+    }
+}
+
 fn setup_loopback() {
     // Bring up the loopback interface for localhost connectivity.
     // This mirrors what libkrun's init does.
@@ -84,10 +145,7 @@ fn run_dhcp_client() {
     for (client, args) in &dhcp_clients {
         if std::path::Path::new(client).exists() {
             eprintln!("ross-init: running DHCP client: {} {:?}", client, args);
-            match std::process::Command::new(client)
-                .args(args)
-                .status()
-            {
+            match std::process::Command::new(client).args(args).status() {
                 Ok(status) if status.success() => {
                     eprintln!("ross-init: DHCP client succeeded");
                     return;
@@ -105,6 +163,51 @@ fn run_dhcp_client() {
     eprintln!("ross-init: no DHCP client found, network may not be configured");
 }
 
+#[cfg(target_os = "linux")]
+fn write_sysctl(path: &str, value: &str) {
+    // Best-effort: these are performance knobs; failure shouldn't prevent booting.
+    if let Err(e) = std::fs::write(path, value) {
+        eprintln!(
+            "ross-init: sysctl write failed: {} = {} ({})",
+            path,
+            value.trim(),
+            e
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn tune_tcp_buffers() {
+    // Make high-bandwidth localhost/host networking fast without requiring user flags like:
+    //   iperf -w 2M ...
+    //
+    // iperf2 uses SO_SNDBUF/SO_RCVBUF; if net.core.{wmem,rmem}_max are small, iperf prints:
+    //   "TCP window size: 416 KByte (WARNING: requested 2.00 MByte)"
+    //
+    // These values are intentionally generous for VM/host-local traffic.
+    write_sysctl("/proc/sys/net/core/rmem_max", "134217728\n"); // 128 MiB
+    write_sysctl("/proc/sys/net/core/wmem_max", "134217728\n"); // 128 MiB
+                                                                // Raise defaults so tools like iperf2 don't need `-w` to reach high throughput.
+                                                                // (Linux may still clamp/double these internally.)
+    write_sysctl("/proc/sys/net/core/rmem_default", "4194304\n"); // 4 MiB
+    write_sysctl("/proc/sys/net/core/wmem_default", "4194304\n"); // 4 MiB
+
+    // Enable autotuning and allow large windows.
+    write_sysctl("/proc/sys/net/ipv4/tcp_window_scaling", "1\n");
+    write_sysctl("/proc/sys/net/ipv4/tcp_moderate_rcvbuf", "1\n");
+
+    // min default max (bytes)
+    // Raise the "default" (middle) values substantially; the max stays high for `-w` requests.
+    write_sysctl("/proc/sys/net/ipv4/tcp_rmem", "4096 4194304 134217728\n");
+    write_sysctl("/proc/sys/net/ipv4/tcp_wmem", "4096 4194304 134217728\n");
+
+    // Avoid throughput drop after brief idle periods (common in bursty workloads).
+    write_sysctl("/proc/sys/net/ipv4/tcp_slow_start_after_idle", "0\n");
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tune_tcp_buffers() {}
+
 fn main() -> ExitCode {
     // Set up loopback interface before anything else
     setup_loopback();
@@ -112,22 +215,27 @@ fn main() -> ExitCode {
     // Try to set up eth0 and get IP via DHCP (for gvproxy/passt networking)
     setup_eth0();
     run_dhcp_client();
+    tune_tcp_buffers();
 
     eprintln!("ross-init: starting");
     eprintln!("ross-init: args = {:?}", env::args().collect::<Vec<_>>());
-    
+
     // Check if config file exists
     match std::fs::metadata(CONFIG_FILE_PATH) {
         Ok(m) => eprintln!("ross-init: config file exists, size = {}", m.len()),
         Err(e) => eprintln!("ross-init: config file check: {}", e),
     }
-    
+
     // Try to read it
     match std::fs::read_to_string(CONFIG_FILE_PATH) {
-        Ok(s) => eprintln!("ross-init: config file contents ({} bytes): {:?}", s.len(), &s[..s.len().min(100)]),
+        Ok(s) => eprintln!(
+            "ross-init: config file contents ({} bytes): {:?}",
+            s.len(),
+            &s[..s.len().min(100)]
+        ),
         Err(e) => eprintln!("ross-init: failed to read config file: {}", e),
     }
-    
+
     // Check env var
     match env::var("ROSS_GUEST_CONFIG") {
         Ok(s) => eprintln!("ross-init: env var set, len = {}", s.len()),
@@ -157,9 +265,11 @@ fn main() -> ExitCode {
         Ok(c) => c,
         Err(e) => {
             eprintln!("ross-init: failed to parse config: {}", e);
-            eprintln!("ross-init: config_json len = {}, first 200 chars: {:?}", 
-                config_json.len(), 
-                &config_json[..config_json.len().min(200)]);
+            eprintln!(
+                "ross-init: config_json len = {}, first 200 chars: {:?}",
+                config_json.len(),
+                &config_json[..config_json.len().min(200)]
+            );
             return ExitCode::from(1);
         }
     };
@@ -173,6 +283,12 @@ fn main() -> ExitCode {
     if config.vsock_port == 0 {
         eprintln!("ross-init: vsock_port is required for interactive mode");
         return ExitCode::from(1);
+    }
+
+    // Mount requested virtio-fs volumes before starting the workload
+    let mount_status = mount_volumes(&config);
+    if mount_status != ExitCode::from(0) {
+        return mount_status;
     }
 
     // Run the command

@@ -6,6 +6,8 @@ use super::dhcp::handle_dhcp;
 use super::dns::{DnsForwarder, handle_dns};
 use super::eth::{ETHERTYPE_ARP, ETHERTYPE_IPV4, IP_PROTO_ICMP, IP_PROTO_TCP, IP_PROTO_UDP};
 use super::nat::{NatState, handle_icmp, handle_tcp, handle_udp, poll_nat_sockets};
+use super::ring::PacketRing as MutexPacketRing;
+use super::ring_spsc::SpscPacketRing;
 use crate::ShimError;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, bind, socket};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -13,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 
 const VFKIT_MAGIC: [u8; 4] = *b"VFKT";
 
@@ -148,11 +151,79 @@ fn run_stack(fd: i32, shutdown: Arc<AtomicBool>) {
         thread::sleep(std::time::Duration::from_millis(10));
     }
 
+    // Default is single-threaded unless explicitly enabled.
+    let workers = net_workers();
+    if workers > 1 {
+        run_stack_multi(fd, shutdown, workers);
+    } else {
+        run_stack_single(fd, shutdown);
+    }
+}
+
+fn net_workers() -> usize {
+    // Opt-in: allow scaling across cores for high-throughput benchmarks (iperf).
+    // More workers generally means higher throughput but also higher CPU usage.
+    //
+    // Example:
+    //   ROSS_NET_WORKERS=4 ross ...
+    if let Ok(v) = std::env::var("ROSS_NET_WORKERS") {
+        if let Ok(n) = v.parse::<usize>() {
+            return n.max(1).min(32);
+        }
+    }
+    1
+}
+
+fn net_direct_send() -> bool {
+    matches!(
+        std::env::var("ROSS_NET_DIRECT_SEND").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
+fn net_ring_lockfree() -> bool {
+    // Opt-in: `ROSS_NET_RING=lockfree` for the SPSC lock-free ring.
+    // Default is the simple mutex queue (kept for simplicity/debuggability).
+    matches!(
+        std::env::var("ROSS_NET_RING").as_deref(),
+        Ok("lockfree") | Ok("spsc")
+    )
+}
+
+trait PacketQueue: Send + Sync {
+    fn push(&self, pkt: &[u8]) -> bool;
+    fn pop(&self, out: &mut [u8]) -> Option<usize>;
+}
+
+impl PacketQueue for MutexPacketRing {
+    #[inline]
+    fn push(&self, pkt: &[u8]) -> bool {
+        MutexPacketRing::push(self, pkt)
+    }
+    #[inline]
+    fn pop(&self, out: &mut [u8]) -> Option<usize> {
+        MutexPacketRing::pop(self, out)
+    }
+}
+
+impl PacketQueue for SpscPacketRing {
+    #[inline]
+    fn push(&self, pkt: &[u8]) -> bool {
+        SpscPacketRing::push(self, pkt)
+    }
+    #[inline]
+    fn pop(&self, out: &mut [u8]) -> Option<usize> {
+        SpscPacketRing::pop(self, out)
+    }
+}
+
+fn run_stack_single(fd: i32, shutdown: Arc<AtomicBool>) {
     // Main loop - prioritize draining VM packets to prevent TX queue stalls
     let mut nat_state = NatState::new();
     let mut dns_forwarder: Option<DnsForwarder> = None;
     let mut pending_responses: Vec<Vec<u8>> = Vec::with_capacity(256);
     let mut nat_responses: Vec<Vec<u8>> = Vec::with_capacity(256);
+    let mut buf = [0u8; 65535];
     let mut idle_count = 0u32;
 
     loop {
@@ -192,14 +263,14 @@ fn run_stack(fd: i32, shutdown: Arc<AtomicBool>) {
 
         // Phase 2: Send pending responses to VM
         for resp in pending_responses.drain(..) {
-            send_packet(fd, &resp);
+            let _ = send_packet(fd, &resp);
         }
 
         // Phase 3: Poll NAT sockets for data from remote servers
         poll_nat_sockets(&mut nat_state, &mut nat_responses);
         let sent_any = !nat_responses.is_empty();
         for resp in nat_responses.drain(..) {
-            send_packet(fd, &resp);
+            let _ = send_packet(fd, &resp);
         }
 
         // Only yield/sleep if we're truly idle
@@ -217,10 +288,266 @@ fn run_stack(fd: i32, shutdown: Arc<AtomicBool>) {
     tracing::debug!("Network stack stopped");
 }
 
-fn send_packet(fd: i32, data: &[u8]) {
-    unsafe {
-        libc::send(fd, data.as_ptr() as *const _, data.len(), 0);
+fn run_stack_multi(fd: i32, shutdown: Arc<AtomicBool>, workers: usize) {
+    tracing::info!(workers, "Network stack running in multi-threaded mode");
+
+    let direct_send = net_direct_send();
+    let lockfree_ring = net_ring_lockfree();
+
+    let make_q = || -> Arc<dyn PacketQueue> {
+        if lockfree_ring {
+            Arc::new(SpscPacketRing::new())
+        } else {
+            Arc::new(MutexPacketRing::new())
+        }
+    };
+
+    let rx_rings: Vec<Arc<dyn PacketQueue>> = (0..workers).map(|_| make_q()).collect();
+    let tx_rings: Vec<Arc<dyn PacketQueue>> = if direct_send {
+        Vec::new()
+    } else {
+        (0..workers).map(|_| make_q()).collect()
+    };
+
+    let mut handles = Vec::with_capacity(workers);
+    for i in 0..workers {
+        let rx = rx_rings[i].clone();
+        let tx = if direct_send {
+            None
+        } else {
+            Some(tx_rings[i].clone())
+        };
+        let shutdown = shutdown.clone();
+        let h = thread::Builder::new()
+            .name(format!("ross-net-worker-{}", i))
+            // Keep a larger stack than default; even with heap buffers, network/NAT code can
+            // get stacky in debug builds.
+            .stack_size(4 * 1024 * 1024)
+            .spawn(move || net_worker_loop(fd, rx, tx, shutdown, direct_send))
+            .expect("spawn net worker");
+        handles.push(h);
     }
+
+    let mut buf = vec![0u8; 65535];
+    let mut out = vec![0u8; 65535];
+    let mut idle_count = 0u32;
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let mut received_any = false;
+        let mut sent_any = false;
+
+        // Phase 1: Drain VM -> dispatch to workers (shard by 5-tuple).
+        loop {
+            let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
+            if n > 0 {
+                received_any = true;
+                let n = n as usize;
+                let shard = shard_for_frame(&buf[..n], workers);
+                // Backpressure: wait for worker to make space instead of dropping.
+                while !rx_rings[shard].push(&buf[..n]) {
+                    if shutdown.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    thread::yield_now();
+                }
+            } else if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    break;
+                } else if err.kind() == std::io::ErrorKind::ConnectionReset {
+                    tracing::debug!("VM disconnected");
+                    return;
+                } else {
+                    tracing::error!(error = %err, "recv error");
+                    return;
+                }
+            } else {
+                tracing::debug!("VM connection closed");
+                return;
+            }
+        }
+
+        // Phase 2: Drain worker -> VM responses (unless workers send directly).
+        if !direct_send {
+            for ring in tx_rings.iter() {
+                while let Some(len) = ring.pop(&mut out) {
+                    sent_any = true;
+                    let _ = send_packet(fd, &out[..len]);
+                }
+            }
+        }
+
+        if received_any || sent_any {
+            idle_count = 0;
+        } else {
+            idle_count = idle_count.saturating_add(1);
+            if idle_count > 10000 {
+                thread::sleep(Duration::from_micros(50));
+            } else {
+                thread::yield_now();
+            }
+        }
+    }
+
+    for h in handles {
+        let _ = h.join();
+    }
+    tracing::debug!("Network stack stopped");
+}
+
+fn net_worker_loop(
+    fd: i32,
+    rx: Arc<dyn PacketQueue>,
+    tx: Option<Arc<dyn PacketQueue>>,
+    shutdown: Arc<AtomicBool>,
+    direct_send: bool,
+) {
+    let mut nat_state = NatState::new();
+    let mut dns_forwarder: Option<DnsForwarder> = None;
+    let mut nat_responses: Vec<Vec<u8>> = Vec::with_capacity(256);
+    let mut buf = vec![0u8; 65535];
+    let mut idle_count = 0u32;
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let mut did_work = false;
+
+        while let Some(len) = rx.pop(&mut buf) {
+            did_work = true;
+            if let Some(resp) = process_frame(&buf[..len], &mut nat_state, &mut dns_forwarder) {
+                if direct_send {
+                    let _ = send_packet(fd, &resp);
+                } else if let Some(ref q) = tx {
+                    while !q.push(&resp) {
+                        if shutdown.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        thread::yield_now();
+                    }
+                }
+            }
+        }
+
+        // Poll NAT sockets for data from remote servers
+        poll_nat_sockets(&mut nat_state, &mut nat_responses);
+        if !nat_responses.is_empty() {
+            did_work = true;
+            for resp in nat_responses.drain(..) {
+                if direct_send {
+                    let _ = send_packet(fd, &resp);
+                } else if let Some(ref q) = tx {
+                    while !q.push(&resp) {
+                        if shutdown.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        thread::yield_now();
+                    }
+                }
+            }
+        }
+
+        if did_work {
+            idle_count = 0;
+        } else {
+            idle_count = idle_count.saturating_add(1);
+            if idle_count > 10000 {
+                thread::sleep(Duration::from_micros(50));
+            } else {
+                thread::yield_now();
+            }
+        }
+    }
+}
+
+fn send_packet(fd: i32, data: &[u8]) -> bool {
+    // Unix datagram send is atomic: it's either sent or it fails.
+    // Under load, the socket can apply backpressure (EAGAIN). We must not drop packets
+    // silently or TCP will collapse. Instead, wait until the socket is writable.
+    loop {
+        let rc = unsafe { libc::send(fd, data.as_ptr() as *const _, data.len(), 0) };
+        if rc >= 0 {
+            return true;
+        }
+
+        let err = std::io::Error::last_os_error();
+        match err.kind() {
+            std::io::ErrorKind::Interrupted => continue,
+            std::io::ErrorKind::WouldBlock => {
+                // Wait for fd to become writable to avoid busy-spinning.
+                let mut pfd = libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                loop {
+                    let prc = unsafe { libc::poll(&mut pfd as *mut libc::pollfd, 1, 1) };
+                    if prc > 0 {
+                        break;
+                    }
+                    if prc == 0 {
+                        // timeout; try again
+                        continue;
+                    }
+                    let perr = std::io::Error::last_os_error();
+                    if perr.kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    tracing::debug!(error = %perr, "poll(POLLOUT) failed");
+                    return false;
+                }
+            }
+            _ => {
+                tracing::debug!(error = %err, "send_packet failed");
+                return false;
+            }
+        }
+    }
+}
+
+#[inline]
+fn shard_for_frame(frame: &[u8], workers: usize) -> usize {
+    if workers <= 1 || frame.len() < 14 {
+        return 0;
+    }
+    let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
+    if ethertype != ETHERTYPE_IPV4 || frame.len() < 14 + 20 {
+        return 0;
+    }
+
+    let ip = &frame[14..];
+    let ihl = (ip[0] & 0x0f) as usize * 4;
+    if ihl < 20 || ip.len() < ihl {
+        return 0;
+    }
+
+    let proto = ip[9];
+    let src_ip = &ip[12..16];
+    let dst_ip = &ip[16..20];
+    let l4 = &ip[ihl..];
+
+    let mut src_port = 0u16;
+    let mut dst_port = 0u16;
+    if (proto == IP_PROTO_TCP || proto == IP_PROTO_UDP) && l4.len() >= 4 {
+        src_port = u16::from_be_bytes([l4[0], l4[1]]);
+        dst_port = u16::from_be_bytes([l4[2], l4[3]]);
+    }
+
+    // Cheap hash; good enough to spread flows across workers.
+    let mut h: u32 = (proto as u32).wrapping_mul(0x9e37_79b9);
+    h ^= u32::from_be_bytes([src_ip[0], src_ip[1], src_ip[2], src_ip[3]]);
+    h = h.rotate_left(13) ^ u32::from_be_bytes([dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]]);
+    // IMPORTANT: include `src_port` in the low bits so modulo small worker counts
+    // (e.g. 8) actually distributes flows. Put dst_port in the high bits.
+    let ports = (src_port as u32) | ((dst_port as u32) << 16);
+    h = h.wrapping_mul(0x85eb_ca6b) ^ ports;
+    (h as usize) % workers
 }
 
 fn process_frame(

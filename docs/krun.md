@@ -97,6 +97,26 @@ ross-cli container run alpine:latest /bin/sh -c "echo Hello from VM"
 ross-cli container run -it alpine:latest /bin/sh
 ```
 
+### Volumes (bind mounts)
+
+When running with libkrun, Ross exposes host directories to the guest using **virtio-fs**
+and mounts them inside the VM before executing the container command.
+
+Use `--volume/-v` with the format:
+
+- `HOST_PATH:GUEST_PATH`
+- `HOST_PATH:GUEST_PATH:ro` (read-only)
+
+Examples:
+
+```bash
+# Mount a host directory at /data inside the container/VM
+ross-cli container run -it --volume /Users/rumpl/data:/data alpine:latest /bin/sh
+
+# Read-only mount
+ross-cli container run --volume /Users/rumpl/config:/etc/config:ro alpine:latest /bin/cat /etc/config/example.conf
+```
+
 ### Container Lifecycle
 
 ```bash
