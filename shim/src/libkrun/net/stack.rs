@@ -6,10 +6,10 @@ use super::dhcp::handle_dhcp;
 use super::dns::{DnsForwarder, handle_dns};
 use super::eth::{ETHERTYPE_ARP, ETHERTYPE_IPV4, IP_PROTO_ICMP, IP_PROTO_TCP, IP_PROTO_UDP};
 use super::nat::{NatState, handle_icmp, handle_tcp, handle_udp, poll_nat_sockets};
-use super::ring::PacketRing as MutexPacketRing;
-use super::ring_spsc::SpscPacketRing;
+use super::ring_spsc::{PacketRef, SpscPacketRing};
 use crate::ShimError;
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, bind, socket};
+use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -40,9 +40,10 @@ impl VmNetwork {
         )
         .map_err(|e| ShimError::RuntimeError(format!("socket: {}", e)))?;
 
-        // Increase receive buffer size to prevent drops during high throughput
+        // Increase receive buffer size to prevent drops during high throughput.
+        // With virtio/vfkit, a too-small rcvbuf can cause the guest TX queue to stall.
         unsafe {
-            let buf_size: libc::c_int = 4 * 1024 * 1024; // 4MB
+            let buf_size: libc::c_int = 64 * 1024 * 1024; // 64MB
             libc::setsockopt(
                 server_fd.as_raw_fd(),
                 libc::SOL_SOCKET,
@@ -54,7 +55,7 @@ impl VmNetwork {
 
         // Also increase send buffer size to reduce backpressure during bursts.
         unsafe {
-            let buf_size: libc::c_int = 4 * 1024 * 1024; // 4MB
+            let buf_size: libc::c_int = 64 * 1024 * 1024; // 64MB
             libc::setsockopt(
                 server_fd.as_raw_fd(),
                 libc::SOL_SOCKET,
@@ -174,47 +175,11 @@ fn net_workers() -> usize {
     1
 }
 
-fn net_direct_send() -> bool {
-    matches!(
-        std::env::var("ROSS_NET_DIRECT_SEND").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    )
-}
-
-fn net_ring_lockfree() -> bool {
-    // Opt-in: `ROSS_NET_RING=lockfree` for the SPSC lock-free ring.
-    // Default is the simple mutex queue (kept for simplicity/debuggability).
-    matches!(
-        std::env::var("ROSS_NET_RING").as_deref(),
-        Ok("lockfree") | Ok("spsc")
-    )
-}
-
-trait PacketQueue: Send + Sync {
-    fn push(&self, pkt: &[u8]) -> bool;
-    fn pop(&self, out: &mut [u8]) -> Option<usize>;
-}
-
-impl PacketQueue for MutexPacketRing {
-    #[inline]
-    fn push(&self, pkt: &[u8]) -> bool {
-        MutexPacketRing::push(self, pkt)
-    }
-    #[inline]
-    fn pop(&self, out: &mut [u8]) -> Option<usize> {
-        MutexPacketRing::pop(self, out)
-    }
-}
-
-impl PacketQueue for SpscPacketRing {
-    #[inline]
-    fn push(&self, pkt: &[u8]) -> bool {
-        SpscPacketRing::push(self, pkt)
-    }
-    #[inline]
-    fn pop(&self, out: &mut [u8]) -> Option<usize> {
-        SpscPacketRing::pop(self, out)
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendResult {
+    Sent,
+    WouldBlock,
+    Failed,
 }
 
 fn run_stack_single(fd: i32, shutdown: Arc<AtomicBool>) {
@@ -224,12 +189,17 @@ fn run_stack_single(fd: i32, shutdown: Arc<AtomicBool>) {
     let mut pending_responses: Vec<Vec<u8>> = Vec::with_capacity(256);
     let mut nat_responses: Vec<Vec<u8>> = Vec::with_capacity(256);
     let mut buf = [0u8; 65535];
+    // Outbox of packets waiting for VM socket to become writable.
+    let mut outbox: VecDeque<Vec<u8>> = VecDeque::with_capacity(1024);
     let mut idle_count = 0u32;
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
         }
+
+        // Phase 0: Flush any queued packets to the VM (never block RX).
+        flush_outbox_nowait(fd, &mut outbox);
 
         let mut received_any = false;
 
@@ -263,14 +233,14 @@ fn run_stack_single(fd: i32, shutdown: Arc<AtomicBool>) {
 
         // Phase 2: Send pending responses to VM
         for resp in pending_responses.drain(..) {
-            let _ = send_packet(fd, &resp);
+            queue_or_send_nowait(fd, &mut outbox, resp);
         }
 
         // Phase 3: Poll NAT sockets for data from remote servers
         poll_nat_sockets(&mut nat_state, &mut nat_responses);
         let sent_any = !nat_responses.is_empty();
         for resp in nat_responses.drain(..) {
-            let _ = send_packet(fd, &resp);
+            queue_or_send_nowait(fd, &mut outbox, resp);
         }
 
         // Only yield/sleep if we're truly idle
@@ -290,46 +260,48 @@ fn run_stack_single(fd: i32, shutdown: Arc<AtomicBool>) {
 
 fn run_stack_multi(fd: i32, shutdown: Arc<AtomicBool>, workers: usize) {
     tracing::info!(workers, "Network stack running in multi-threaded mode");
+    run_stack_multi_lockfree(fd, shutdown, workers);
+}
 
-    let direct_send = net_direct_send();
-    let lockfree_ring = net_ring_lockfree();
+fn run_stack_multi_lockfree(fd: i32, shutdown: Arc<AtomicBool>, workers: usize) {
+    tracing::info!(workers, "Multi-threaded lock-free mode");
 
-    let make_q = || -> Arc<dyn PacketQueue> {
-        if lockfree_ring {
-            Arc::new(SpscPacketRing::new())
-        } else {
-            Arc::new(MutexPacketRing::new())
-        }
-    };
+    let rx_rings: Vec<Arc<SpscPacketRing>> = (0..workers)
+        .map(|_| Arc::new(SpscPacketRing::new()))
+        .collect();
+    let tx_rings: Vec<Arc<SpscPacketRing>> = (0..workers)
+        .map(|_| Arc::new(SpscPacketRing::new()))
+        .collect();
 
-    let rx_rings: Vec<Arc<dyn PacketQueue>> = (0..workers).map(|_| make_q()).collect();
-    let tx_rings: Vec<Arc<dyn PacketQueue>> = if direct_send {
-        Vec::new()
-    } else {
-        (0..workers).map(|_| make_q()).collect()
-    };
-
+    // Spawn workers.
     let mut handles = Vec::with_capacity(workers);
     for i in 0..workers {
         let rx = rx_rings[i].clone();
-        let tx = if direct_send {
-            None
-        } else {
-            Some(tx_rings[i].clone())
-        };
+        let tx = tx_rings[i].clone();
         let shutdown = shutdown.clone();
         let h = thread::Builder::new()
             .name(format!("ross-net-worker-{}", i))
-            // Keep a larger stack than default; even with heap buffers, network/NAT code can
-            // get stacky in debug builds.
             .stack_size(4 * 1024 * 1024)
-            .spawn(move || net_worker_loop(fd, rx, tx, shutdown, direct_send))
+            .spawn(move || net_worker_loop_lockfree(fd, rx, tx, shutdown, false))
             .expect("spawn net worker");
         handles.push(h);
     }
 
+    // Dedicated TX thread: drains TX rings and performs blocking sends.
+    let tx_handle = {
+        let shutdown = shutdown.clone();
+        let tx_rings = tx_rings.clone();
+        Some(
+            thread::Builder::new()
+                .name("ross-net-tx".to_string())
+                .stack_size(2 * 1024 * 1024)
+                .spawn(move || tx_sender_loop_lockfree(fd, tx_rings, shutdown))
+                .expect("spawn net tx"),
+        )
+    };
+
+    // Main thread: VM RX -> dispatch to workers.
     let mut buf = vec![0u8; 65535];
-    let mut out = vec![0u8; 65535];
     let mut idle_count = 0u32;
 
     loop {
@@ -338,22 +310,15 @@ fn run_stack_multi(fd: i32, shutdown: Arc<AtomicBool>, workers: usize) {
         }
 
         let mut received_any = false;
-        let mut sent_any = false;
-
-        // Phase 1: Drain VM -> dispatch to workers (shard by 5-tuple).
         loop {
             let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
             if n > 0 {
                 received_any = true;
                 let n = n as usize;
                 let shard = shard_for_frame(&buf[..n], workers);
-                // Backpressure: wait for worker to make space instead of dropping.
-                while !rx_rings[shard].push(&buf[..n]) {
-                    if shutdown.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    thread::yield_now();
-                }
+                // CRITICAL: never spin-wait on ring capacity here; it stalls VM draining
+                // and triggers virtio-net TX watchdog timeouts. Drop instead.
+                let _ = rx_rings[shard].push(&buf[..n]);
             } else if n < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::WouldBlock {
@@ -371,17 +336,7 @@ fn run_stack_multi(fd: i32, shutdown: Arc<AtomicBool>, workers: usize) {
             }
         }
 
-        // Phase 2: Drain worker -> VM responses (unless workers send directly).
-        if !direct_send {
-            for ring in tx_rings.iter() {
-                while let Some(len) = ring.pop(&mut out) {
-                    sent_any = true;
-                    let _ = send_packet(fd, &out[..len]);
-                }
-            }
-        }
-
-        if received_any || sent_any {
+        if received_any {
             idle_count = 0;
         } else {
             idle_count = idle_count.saturating_add(1);
@@ -396,20 +351,24 @@ fn run_stack_multi(fd: i32, shutdown: Arc<AtomicBool>, workers: usize) {
     for h in handles {
         let _ = h.join();
     }
+    if let Some(h) = tx_handle {
+        let _ = h.join();
+    }
     tracing::debug!("Network stack stopped");
 }
 
-fn net_worker_loop(
+fn net_worker_loop_lockfree(
     fd: i32,
-    rx: Arc<dyn PacketQueue>,
-    tx: Option<Arc<dyn PacketQueue>>,
+    rx: Arc<SpscPacketRing>,
+    tx: Arc<SpscPacketRing>,
     shutdown: Arc<AtomicBool>,
     direct_send: bool,
 ) {
     let mut nat_state = NatState::new();
     let mut dns_forwarder: Option<DnsForwarder> = None;
     let mut nat_responses: Vec<Vec<u8>> = Vec::with_capacity(256);
-    let mut buf = vec![0u8; 65535];
+    let mut outbox: VecDeque<Vec<u8>> = VecDeque::with_capacity(1024);
+    let mut pending_tx: VecDeque<Vec<u8>> = VecDeque::with_capacity(1024);
     let mut idle_count = 0u32;
 
     loop {
@@ -419,35 +378,41 @@ fn net_worker_loop(
 
         let mut did_work = false;
 
-        while let Some(len) = rx.pop(&mut buf) {
+        // Flush pending responses to TX ring first (never spin).
+        while let Some(front) = pending_tx.front() {
+            if tx.push(front) {
+                let _ = pending_tx.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if direct_send {
+            flush_outbox_nowait(fd, &mut outbox);
+        }
+
+        while let Some(pkt) = rx.pop_ref() {
             did_work = true;
-            if let Some(resp) = process_frame(&buf[..len], &mut nat_state, &mut dns_forwarder) {
+            if let Some(resp) = process_frame(&pkt, &mut nat_state, &mut dns_forwarder) {
                 if direct_send {
-                    let _ = send_packet(fd, &resp);
-                } else if let Some(ref q) = tx {
-                    while !q.push(&resp) {
-                        if shutdown.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        thread::yield_now();
+                    queue_or_send_nowait(fd, &mut outbox, resp);
+                } else {
+                    if !tx.push(&resp) && pending_tx.len() < 4096 {
+                        pending_tx.push_back(resp);
                     }
                 }
             }
         }
 
-        // Poll NAT sockets for data from remote servers
         poll_nat_sockets(&mut nat_state, &mut nat_responses);
         if !nat_responses.is_empty() {
             did_work = true;
             for resp in nat_responses.drain(..) {
                 if direct_send {
-                    let _ = send_packet(fd, &resp);
-                } else if let Some(ref q) = tx {
-                    while !q.push(&resp) {
-                        if shutdown.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        thread::yield_now();
+                    queue_or_send_nowait(fd, &mut outbox, resp);
+                } else {
+                    if !tx.push(&resp) && pending_tx.len() < 4096 {
+                        pending_tx.push_back(resp);
                     }
                 }
             }
@@ -466,13 +431,41 @@ fn net_worker_loop(
     }
 }
 
-fn send_packet(fd: i32, data: &[u8]) -> bool {
-    // Unix datagram send is atomic: it's either sent or it fails.
-    // Under load, the socket can apply backpressure (EAGAIN). We must not drop packets
-    // silently or TCP will collapse. Instead, wait until the socket is writable.
+fn tx_sender_loop_lockfree(fd: i32, tx_rings: Vec<Arc<SpscPacketRing>>, shutdown: Arc<AtomicBool>) {
+    // Send directly from ring storage (no memcpy) and only poll when we hit EAGAIN.
     loop {
-        let rc = unsafe { libc::send(fd, data.as_ptr() as *const _, data.len(), 0) };
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let mut did_work = false;
+
+        for ring in tx_rings.iter() {
+            loop {
+                let Some(pkt) = ring.pop_ref() else { break };
+                did_work = true;
+                if !send_packet_ref(fd, pkt) {
+                    // Permanent send failure; keep looping to avoid deadlock.
+                    break;
+                }
+            }
+        }
+
+        if !did_work {
+            thread::yield_now();
+        }
+    }
+}
+
+fn send_packet_ref(fd: i32, pkt: PacketRef<'_>) -> bool {
+    // Keep pkt alive across retries; it is consumed when dropped.
+    let mut pkt = Some(pkt);
+    loop {
+        let p = pkt.as_ref().unwrap();
+        let rc = unsafe { libc::send(fd, p.as_ptr() as *const _, p.len(), 0) };
         if rc >= 0 {
+            // Consume packet now.
+            drop(pkt.take());
             return true;
         }
 
@@ -480,7 +473,6 @@ fn send_packet(fd: i32, data: &[u8]) -> bool {
         match err.kind() {
             std::io::ErrorKind::Interrupted => continue,
             std::io::ErrorKind::WouldBlock => {
-                // Wait for fd to become writable to avoid busy-spinning.
                 let mut pfd = libc::pollfd {
                     fd,
                     events: libc::POLLOUT,
@@ -492,7 +484,6 @@ fn send_packet(fd: i32, data: &[u8]) -> bool {
                         break;
                     }
                     if prc == 0 {
-                        // timeout; try again
                         continue;
                     }
                     let perr = std::io::Error::last_os_error();
@@ -504,8 +495,63 @@ fn send_packet(fd: i32, data: &[u8]) -> bool {
                 }
             }
             _ => {
-                tracing::debug!(error = %err, "send_packet failed");
+                tracing::debug!(error = %err, "send failed");
                 return false;
+            }
+        }
+    }
+}
+
+fn send_packet_nowait(fd: i32, data: &[u8]) -> SendResult {
+    // Unix datagram send is atomic: it's either sent or it fails.
+    // Under load, the socket can apply backpressure (EAGAIN). In the RX/drain loop,
+    // we must NOT block waiting for POLLOUT; queue instead.
+    loop {
+        let rc = unsafe { libc::send(fd, data.as_ptr() as *const _, data.len(), 0) };
+        if rc >= 0 {
+            return SendResult::Sent;
+        }
+        let err = std::io::Error::last_os_error();
+        match err.kind() {
+            std::io::ErrorKind::Interrupted => continue,
+            std::io::ErrorKind::WouldBlock => return SendResult::WouldBlock,
+            _ => {
+                tracing::debug!(error = %err, "send_packet_nowait failed");
+                return SendResult::Failed;
+            }
+        }
+    }
+}
+
+fn queue_or_send_nowait(fd: i32, outbox: &mut VecDeque<Vec<u8>>, pkt: Vec<u8>) {
+    const OUTBOX_MAX: usize = 4096;
+    if outbox.is_empty() {
+        match send_packet_nowait(fd, &pkt) {
+            SendResult::Sent => return,
+            SendResult::WouldBlock => {
+                if outbox.len() < OUTBOX_MAX {
+                    outbox.push_back(pkt);
+                }
+                return;
+            }
+            SendResult::Failed => return,
+        }
+    } else {
+        if outbox.len() < OUTBOX_MAX {
+            outbox.push_back(pkt);
+        }
+    }
+}
+
+fn flush_outbox_nowait(fd: i32, outbox: &mut VecDeque<Vec<u8>>) {
+    while let Some(pkt) = outbox.front() {
+        match send_packet_nowait(fd, pkt) {
+            SendResult::Sent => {
+                let _ = outbox.pop_front();
+            }
+            SendResult::WouldBlock => break,
+            SendResult::Failed => {
+                let _ = outbox.pop_front();
             }
         }
     }

@@ -1,8 +1,8 @@
 //! NAT for TCP and UDP connections.
 
 use super::eth::{
-    build_eth_header, build_ip_header, checksum, tcp_udp_checksum, ETHERTYPE_IPV4, IP_PROTO_ICMP,
-    IP_PROTO_TCP, IP_PROTO_UDP,
+    ETHERTYPE_IPV4, IP_PROTO_ICMP, IP_PROTO_TCP, IP_PROTO_UDP, build_eth_header, build_ip_header,
+    checksum, tcp_udp_checksum,
 };
 use super::{GATEWAY_MAC, HOST_IP};
 use std::collections::HashMap;
@@ -168,13 +168,20 @@ pub fn handle_udp(
         socket.set_nonblocking(true).ok();
         // Connect to actual IP (localhost for HOST_IP)
         let dst = SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::new(actual_ip[0], actual_ip[1], actual_ip[2], actual_ip[3])),
+            IpAddr::V4(Ipv4Addr::new(
+                actual_ip[0],
+                actual_ip[1],
+                actual_ip[2],
+                actual_ip[3],
+            )),
             dst_port,
         );
         socket.connect(dst).ok();
         UdpNatEntry {
             socket,
-            client_mac: [src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]],
+            client_mac: [
+                src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5],
+            ],
             client_ip: [src_ip[0], src_ip[1], src_ip[2], src_ip[3]],
             client_port: src_port,
             last_active: Instant::now(),
@@ -187,16 +194,24 @@ pub fn handle_udp(
     if let Ok(len) = entry.socket.recv(&mut state.udp_rx_buf) {
         // Use original_ip in response so guest sees the IP it connected to
         return build_udp_response(
-            &entry.client_mac, &entry.client_ip, entry.client_port,
-            dst_port, &original_ip, &state.udp_rx_buf[..len],
+            &entry.client_mac,
+            &entry.client_ip,
+            entry.client_port,
+            dst_port,
+            &original_ip,
+            &state.udp_rx_buf[..len],
         );
     }
     None
 }
 
 fn build_udp_response(
-    dst_mac: &[u8], dst_ip: &[u8], dst_port: u16,
-    src_port: u16, src_ip: &[u8], data: &[u8],
+    dst_mac: &[u8],
+    dst_ip: &[u8],
+    dst_port: u16,
+    src_port: u16,
+    src_ip: &[u8],
+    data: &[u8],
 ) -> Option<Vec<u8>> {
     let udp_len = 8 + data.len();
     let ip = build_ip_header(src_ip, dst_ip, IP_PROTO_UDP, udp_len, 0);
@@ -246,11 +261,26 @@ pub fn handle_tcp(
     let fin = flags & 0x01 != 0;
     let rst = flags & 0x04 != 0;
 
-    let data = if data_offset < payload.len() { &payload[data_offset..] } else { &[] };
-    let key = ([dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]], dst_port, src_port);
+    let data = if data_offset < payload.len() {
+        &payload[data_offset..]
+    } else {
+        &[]
+    };
+    let key = (
+        [dst_ip[0], dst_ip[1], dst_ip[2], dst_ip[3]],
+        dst_port,
+        src_port,
+    );
 
     tracing::trace!(
-        src_port, dst_port, seq, ack, syn, ack_flag, fin, rst,
+        src_port,
+        dst_port,
+        seq,
+        ack,
+        syn,
+        ack_flag,
+        fin,
+        rst,
         data_len = data.len(),
         "TCP rx"
     );
@@ -285,18 +315,30 @@ pub fn handle_tcp(
     // Handle retransmit
     if seq < entry.expected_guest_seq {
         return build_tcp_packet(
-            &entry.client_mac, &entry.client_ip, entry.client_port,
-            entry.remote_port, &entry.remote_ip,
-            entry.our_seq, entry.expected_guest_seq, 0x10, &[],
+            &entry.client_mac,
+            &entry.client_ip,
+            entry.client_port,
+            entry.remote_port,
+            &entry.remote_ip,
+            entry.our_seq,
+            entry.expected_guest_seq,
+            0x10,
+            &[],
         );
     }
 
     // Out of order
     if seq > entry.expected_guest_seq && !data.is_empty() {
         return build_tcp_packet(
-            &entry.client_mac, &entry.client_ip, entry.client_port,
-            entry.remote_port, &entry.remote_ip,
-            entry.our_seq, entry.expected_guest_seq, 0x10, &[],
+            &entry.client_mac,
+            &entry.client_ip,
+            entry.client_port,
+            entry.remote_port,
+            &entry.remote_ip,
+            entry.our_seq,
+            entry.expected_guest_seq,
+            0x10,
+            &[],
         );
     }
 
@@ -308,9 +350,15 @@ pub fn handle_tcp(
             match entry.stream.write(data) {
                 Ok(0) => {
                     let resp = build_tcp_packet(
-                        &entry.client_mac, &entry.client_ip, entry.client_port,
-                        entry.remote_port, &entry.remote_ip,
-                        0, 0, 0x04, &[],
+                        &entry.client_mac,
+                        &entry.client_ip,
+                        entry.client_port,
+                        entry.remote_port,
+                        &entry.remote_ip,
+                        0,
+                        0,
+                        0x04,
+                        &[],
                     );
                     state.tcp.remove(&key);
                     return resp;
@@ -329,9 +377,15 @@ pub fn handle_tcp(
                 Err(e) => {
                     tracing::debug!(error = %e, "TCP write failed");
                     let resp = build_tcp_packet(
-                        &entry.client_mac, &entry.client_ip, entry.client_port,
-                        entry.remote_port, &entry.remote_ip,
-                        0, 0, 0x04, &[],
+                        &entry.client_mac,
+                        &entry.client_ip,
+                        entry.client_port,
+                        entry.remote_port,
+                        &entry.remote_ip,
+                        0,
+                        0,
+                        0x04,
+                        &[],
                     );
                     state.tcp.remove(&key);
                     return resp;
@@ -350,13 +404,22 @@ pub fn handle_tcp(
 
     // Try to flush write buffer
     if entry.write_offset < entry.write_buffer.len() {
-        match entry.stream.write(&entry.write_buffer[entry.write_offset..]) {
+        match entry
+            .stream
+            .write(&entry.write_buffer[entry.write_offset..])
+        {
             Ok(0) => {
                 // Connection closed
                 let resp = build_tcp_packet(
-                    &entry.client_mac, &entry.client_ip, entry.client_port,
-                    entry.remote_port, &entry.remote_ip,
-                    0, 0, 0x04, &[],
+                    &entry.client_mac,
+                    &entry.client_ip,
+                    entry.client_port,
+                    entry.remote_port,
+                    &entry.remote_ip,
+                    0,
+                    0,
+                    0x04,
+                    &[],
                 );
                 state.tcp.remove(&key);
                 return resp;
@@ -364,7 +427,9 @@ pub fn handle_tcp(
             Ok(n) => {
                 entry.write_offset = entry.write_offset.saturating_add(n);
                 // Occasionally compact to avoid unbounded growth if we append a lot.
-                if entry.write_offset > 64 * 1024 && entry.write_offset >= entry.write_buffer.len() / 2 {
+                if entry.write_offset > 64 * 1024
+                    && entry.write_offset >= entry.write_buffer.len() / 2
+                {
                     compact_write_buffer(entry);
                 } else if entry.write_offset >= entry.write_buffer.len() {
                     entry.write_buffer.clear();
@@ -377,9 +442,15 @@ pub fn handle_tcp(
             Err(e) => {
                 tracing::debug!(error = %e, "TCP write failed");
                 let resp = build_tcp_packet(
-                    &entry.client_mac, &entry.client_ip, entry.client_port,
-                    entry.remote_port, &entry.remote_ip,
-                    0, 0, 0x04, &[],
+                    &entry.client_mac,
+                    &entry.client_ip,
+                    entry.client_port,
+                    entry.remote_port,
+                    &entry.remote_ip,
+                    0,
+                    0,
+                    0x04,
+                    &[],
                 );
                 state.tcp.remove(&key);
                 return resp;
@@ -391,9 +462,15 @@ pub fn handle_tcp(
     if fin {
         entry.expected_guest_seq = entry.expected_guest_seq.wrapping_add(1);
         let resp = build_tcp_packet(
-            &entry.client_mac, &entry.client_ip, entry.client_port,
-            entry.remote_port, &entry.remote_ip,
-            entry.our_seq, entry.expected_guest_seq, 0x11, &[],
+            &entry.client_mac,
+            &entry.client_ip,
+            entry.client_port,
+            entry.remote_port,
+            &entry.remote_ip,
+            entry.our_seq,
+            entry.expected_guest_seq,
+            0x11,
+            &[],
         );
         state.tcp.remove(&key);
         return resp;
@@ -404,18 +481,30 @@ pub fn handle_tcp(
         match entry.stream.read(&mut state.tcp_rx_buf) {
             Ok(0) => {
                 let resp = build_tcp_packet(
-                    &entry.client_mac, &entry.client_ip, entry.client_port,
-                    entry.remote_port, &entry.remote_ip,
-                    entry.our_seq, entry.expected_guest_seq, 0x11, &[],
+                    &entry.client_mac,
+                    &entry.client_ip,
+                    entry.client_port,
+                    entry.remote_port,
+                    &entry.remote_ip,
+                    entry.our_seq,
+                    entry.expected_guest_seq,
+                    0x11,
+                    &[],
                 );
                 state.tcp.remove(&key);
                 return resp;
             }
             Ok(len) => {
                 let resp = build_tcp_packet(
-                    &entry.client_mac, &entry.client_ip, entry.client_port,
-                    entry.remote_port, &entry.remote_ip,
-                    entry.our_seq, entry.expected_guest_seq, 0x18, &state.tcp_rx_buf[..len],
+                    &entry.client_mac,
+                    &entry.client_ip,
+                    entry.client_port,
+                    entry.remote_port,
+                    &entry.remote_ip,
+                    entry.our_seq,
+                    entry.expected_guest_seq,
+                    0x18,
+                    &state.tcp_rx_buf[..len],
                 );
                 entry.our_seq = entry.our_seq.wrapping_add(len as u32);
                 return resp;
@@ -423,18 +512,30 @@ pub fn handle_tcp(
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if !data.is_empty() || ack_flag {
                     return build_tcp_packet(
-                        &entry.client_mac, &entry.client_ip, entry.client_port,
-                        entry.remote_port, &entry.remote_ip,
-                        entry.our_seq, entry.expected_guest_seq, 0x10, &[],
+                        &entry.client_mac,
+                        &entry.client_ip,
+                        entry.client_port,
+                        entry.remote_port,
+                        &entry.remote_ip,
+                        entry.our_seq,
+                        entry.expected_guest_seq,
+                        0x10,
+                        &[],
                     );
                 }
             }
             Err(e) => {
                 tracing::debug!(error = %e, "TCP read failed");
                 let resp = build_tcp_packet(
-                    &entry.client_mac, &entry.client_ip, entry.client_port,
-                    entry.remote_port, &entry.remote_ip,
-                    0, 0, 0x04, &[],
+                    &entry.client_mac,
+                    &entry.client_ip,
+                    entry.client_port,
+                    entry.remote_port,
+                    &entry.remote_ip,
+                    0,
+                    0,
+                    0x04,
+                    &[],
                 );
                 state.tcp.remove(&key);
                 return resp;
@@ -443,9 +544,15 @@ pub fn handle_tcp(
     } else if !data.is_empty() {
         // Can't send but need to ACK guest data
         return build_tcp_packet(
-            &entry.client_mac, &entry.client_ip, entry.client_port,
-            entry.remote_port, &entry.remote_ip,
-            entry.our_seq, entry.expected_guest_seq, 0x10, &[],
+            &entry.client_mac,
+            &entry.client_ip,
+            entry.client_port,
+            entry.remote_port,
+            &entry.remote_ip,
+            entry.our_seq,
+            entry.expected_guest_seq,
+            0x10,
+            &[],
         );
     }
 
@@ -468,7 +575,12 @@ fn handle_tcp_syn(
     let (actual_ip, original_ip) = translate_host_ip(dst_ip);
 
     let dst = SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::new(actual_ip[0], actual_ip[1], actual_ip[2], actual_ip[3])),
+        IpAddr::V4(Ipv4Addr::new(
+            actual_ip[0],
+            actual_ip[1],
+            actual_ip[2],
+            actual_ip[3],
+        )),
         dst_port,
     );
 
@@ -491,23 +603,28 @@ fn handle_tcp_syn(
             let our_seq = 1000u32;
             let expected_guest_seq = seq.wrapping_add(1);
 
-            state.tcp.insert(key, TcpNatEntry {
-                stream,
-                client_mac: [src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5]],
-                client_ip: [src_ip[0], src_ip[1], src_ip[2], src_ip[3]],
-                client_port: src_port,
-                // Store original_ip so responses go back with the IP guest expects
-                remote_ip: original_ip,
-                remote_port: dst_port,
-                our_seq: our_seq.wrapping_add(1),
-                acked_seq: our_seq, // Guest hasn't ACKed anything yet
-                expected_guest_seq,
-                last_active: Instant::now(),
-                guest_window: 65535,
-                guest_wscale,
-                write_buffer: Vec::new(),
-                write_offset: 0,
-            });
+            state.tcp.insert(
+                key,
+                TcpNatEntry {
+                    stream,
+                    client_mac: [
+                        src_mac[0], src_mac[1], src_mac[2], src_mac[3], src_mac[4], src_mac[5],
+                    ],
+                    client_ip: [src_ip[0], src_ip[1], src_ip[2], src_ip[3]],
+                    client_port: src_port,
+                    // Store original_ip so responses go back with the IP guest expects
+                    remote_ip: original_ip,
+                    remote_port: dst_port,
+                    our_seq: our_seq.wrapping_add(1),
+                    acked_seq: our_seq, // Guest hasn't ACKed anything yet
+                    expected_guest_seq,
+                    last_active: Instant::now(),
+                    guest_window: 65535,
+                    guest_wscale,
+                    write_buffer: Vec::new(),
+                    write_offset: 0,
+                },
+            );
 
             build_tcp_synack(
                 src_mac,
@@ -522,7 +639,17 @@ fn handle_tcp_syn(
         }
         Err(e) => {
             tracing::debug!(error = %e, "TCP connect failed");
-            build_tcp_packet(src_mac, src_ip, src_port, dst_port, &original_ip, 0, seq.wrapping_add(1), 0x14, &[])
+            build_tcp_packet(
+                src_mac,
+                src_ip,
+                src_port,
+                dst_port,
+                &original_ip,
+                0,
+                seq.wrapping_add(1),
+                0x14,
+                &[],
+            )
         }
     }
 }
@@ -538,7 +665,6 @@ fn build_tcp_synack(
     our_wscale: u8,
 ) -> Option<Vec<u8>> {
     // TCP options: MSS (4) + WS (4 incl NOP padding) = 8 bytes.
-    // MSS=1460, NOP, WS=our_wscale, NOP padding.
     let mut opts = [0u8; 8];
     // MSS
     opts[0] = 2;
@@ -551,16 +677,42 @@ fn build_tcp_synack(
     opts[7] = our_wscale;
 
     build_tcp_packet_with_options(
-        dst_mac, dst_ip, dst_port, src_port, src_ip, seq, ack, 0x12, &opts, &[],
+        dst_mac,
+        dst_ip,
+        dst_port,
+        src_port,
+        src_ip,
+        seq,
+        ack,
+        0x12,
+        &opts,
+        &[],
     )
 }
 
 fn build_tcp_packet(
-    dst_mac: &[u8], dst_ip: &[u8], dst_port: u16,
-    src_port: u16, src_ip: &[u8],
-    seq: u32, ack: u32, flags: u8, data: &[u8],
+    dst_mac: &[u8],
+    dst_ip: &[u8],
+    dst_port: u16,
+    src_port: u16,
+    src_ip: &[u8],
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    data: &[u8],
 ) -> Option<Vec<u8>> {
-    build_tcp_packet_with_options(dst_mac, dst_ip, dst_port, src_port, src_ip, seq, ack, flags, &[], data)
+    build_tcp_packet_with_options(
+        dst_mac,
+        dst_ip,
+        dst_port,
+        src_port,
+        src_ip,
+        seq,
+        ack,
+        flags,
+        &[],
+        data,
+    )
 }
 
 fn build_tcp_packet_with_options(
@@ -602,7 +754,14 @@ fn build_tcp_packet_with_options(
     let tcp_end = tcp_start + tcp_len;
     let cksum = tcp_udp_checksum(src_ip, dst_ip, IP_PROTO_TCP, &response[tcp_start..tcp_end]);
     response[tcp_start + 16..tcp_start + 18].copy_from_slice(&cksum.to_be_bytes());
-    tracing::trace!(seq, ack, flags, data_len = data.len(), opt_len = options.len(), "TCP tx");
+    tracing::trace!(
+        seq,
+        ack,
+        flags,
+        data_len = data.len(),
+        opt_len = options.len(),
+        "TCP tx"
+    );
     Some(response)
 }
 
@@ -657,21 +816,28 @@ pub fn poll_nat_sockets(state: &mut NatState, responses: &mut Vec<Vec<u8>>) {
     // Poll TCP - send multiple packets per connection for better throughput
     const MAX_PACKETS_PER_CONN: usize = 16;
     state.tcp_keys_scratch.clear();
-    state
-        .tcp_keys_scratch
-        .extend(state.tcp.keys().cloned());
-    
+    state.tcp_keys_scratch.extend(state.tcp.keys().cloned());
+
     for key in state.tcp_keys_scratch.iter().cloned() {
         // First, try to flush any pending write buffer
         if let Some(entry) = state.tcp.get_mut(&key) {
             if entry.write_offset < entry.write_buffer.len() {
-                match entry.stream.write(&entry.write_buffer[entry.write_offset..]) {
+                match entry
+                    .stream
+                    .write(&entry.write_buffer[entry.write_offset..])
+                {
                     Ok(0) => {
                         // Connection closed
                         if let Some(resp) = build_tcp_packet(
-                            &entry.client_mac, &entry.client_ip, entry.client_port,
-                            entry.remote_port, &entry.remote_ip,
-                            0, 0, 0x04, &[],
+                            &entry.client_mac,
+                            &entry.client_ip,
+                            entry.client_port,
+                            entry.remote_port,
+                            &entry.remote_ip,
+                            0,
+                            0,
+                            0x04,
+                            &[],
                         ) {
                             responses.push(resp);
                         }
@@ -680,7 +846,9 @@ pub fn poll_nat_sockets(state: &mut NatState, responses: &mut Vec<Vec<u8>>) {
                     }
                     Ok(n) => {
                         entry.write_offset = entry.write_offset.saturating_add(n);
-                        if entry.write_offset > 64 * 1024 && entry.write_offset >= entry.write_buffer.len() / 2 {
+                        if entry.write_offset > 64 * 1024
+                            && entry.write_offset >= entry.write_buffer.len() / 2
+                        {
                             compact_write_buffer(entry);
                         } else if entry.write_offset >= entry.write_buffer.len() {
                             entry.write_buffer.clear();
@@ -690,9 +858,15 @@ pub fn poll_nat_sockets(state: &mut NatState, responses: &mut Vec<Vec<u8>>) {
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(_) => {
                         if let Some(resp) = build_tcp_packet(
-                            &entry.client_mac, &entry.client_ip, entry.client_port,
-                            entry.remote_port, &entry.remote_ip,
-                            0, 0, 0x04, &[],
+                            &entry.client_mac,
+                            &entry.client_ip,
+                            entry.client_port,
+                            entry.remote_port,
+                            &entry.remote_ip,
+                            0,
+                            0,
+                            0x04,
+                            &[],
                         ) {
                             responses.push(resp);
                         }
@@ -705,12 +879,12 @@ pub fn poll_nat_sockets(state: &mut NatState, responses: &mut Vec<Vec<u8>>) {
 
         // Then read data from server to send to guest
         let mut packets_sent = 0;
-        
+
         while packets_sent < MAX_PACKETS_PER_CONN {
             let Some(entry) = state.tcp.get_mut(&key) else {
                 break;
             };
-            
+
             if !entry.can_send() {
                 break;
             }
@@ -719,9 +893,15 @@ pub fn poll_nat_sockets(state: &mut NatState, responses: &mut Vec<Vec<u8>>) {
                 Ok(0) => {
                     // Connection closed
                     if let Some(resp) = build_tcp_packet(
-                        &entry.client_mac, &entry.client_ip, entry.client_port,
-                        entry.remote_port, &entry.remote_ip,
-                        entry.our_seq, entry.expected_guest_seq, 0x11, &[],
+                        &entry.client_mac,
+                        &entry.client_ip,
+                        entry.client_port,
+                        entry.remote_port,
+                        &entry.remote_ip,
+                        entry.our_seq,
+                        entry.expected_guest_seq,
+                        0x11,
+                        &[],
                     ) {
                         responses.push(resp);
                     }
@@ -730,9 +910,15 @@ pub fn poll_nat_sockets(state: &mut NatState, responses: &mut Vec<Vec<u8>>) {
                 }
                 Ok(len) => {
                     if let Some(resp) = build_tcp_packet(
-                        &entry.client_mac, &entry.client_ip, entry.client_port,
-                        entry.remote_port, &entry.remote_ip,
-                        entry.our_seq, entry.expected_guest_seq, 0x18, &state.tcp_rx_buf[..len],
+                        &entry.client_mac,
+                        &entry.client_ip,
+                        entry.client_port,
+                        entry.remote_port,
+                        &entry.remote_ip,
+                        entry.our_seq,
+                        entry.expected_guest_seq,
+                        0x18,
+                        &state.tcp_rx_buf[..len],
                     ) {
                         responses.push(resp);
                     }
@@ -748,9 +934,15 @@ pub fn poll_nat_sockets(state: &mut NatState, responses: &mut Vec<Vec<u8>>) {
                     // Error - send RST
                     if let Some(entry) = state.tcp.get(&key)
                         && let Some(resp) = build_tcp_packet(
-                            &entry.client_mac, &entry.client_ip, entry.client_port,
-                            entry.remote_port, &entry.remote_ip,
-                            0, 0, 0x04, &[],
+                            &entry.client_mac,
+                            &entry.client_ip,
+                            entry.client_port,
+                            entry.remote_port,
+                            &entry.remote_ip,
+                            0,
+                            0,
+                            0x04,
+                            &[],
                         )
                     {
                         responses.push(resp);
@@ -764,8 +956,12 @@ pub fn poll_nat_sockets(state: &mut NatState, responses: &mut Vec<Vec<u8>>) {
 
     // Cleanup stale connections
     let now = Instant::now();
-    state.udp.retain(|_, e| now.duration_since(e.last_active) < Duration::from_secs(60));
-    state.tcp.retain(|_, e| now.duration_since(e.last_active) < Duration::from_secs(300));
+    state
+        .udp
+        .retain(|_, e| now.duration_since(e.last_active) < Duration::from_secs(60));
+    state
+        .tcp
+        .retain(|_, e| now.duration_since(e.last_active) < Duration::from_secs(300));
 }
 
 #[inline]
@@ -779,9 +975,7 @@ fn compact_write_buffer(entry: &mut TcpNatEntry) {
         return;
     }
     let remaining = entry.write_buffer.len() - entry.write_offset;
-    entry
-        .write_buffer
-        .copy_within(entry.write_offset.., 0);
+    entry.write_buffer.copy_within(entry.write_offset.., 0);
     entry.write_buffer.truncate(remaining);
     entry.write_offset = 0;
 }

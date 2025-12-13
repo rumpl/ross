@@ -18,51 +18,84 @@ pub fn build_eth_header(dst: &[u8], src: &[u8], ethertype: u16) -> [u8; 14] {
 
 /// Calculate IP/ICMP/TCP/UDP checksum.
 pub fn checksum(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    let mut i = 0;
-    while i < data.len() {
-        let word = if i + 1 < data.len() {
-            u16::from_be_bytes([data[i], data[i + 1]])
-        } else {
-            u16::from_be_bytes([data[i], 0])
-        };
-        sum += word as u32;
-        i += 2;
-    }
-    while sum >> 16 != 0 {
+    finalize_checksum(sum_be_words(data))
+}
+
+/// Calculate TCP/UDP checksum with pseudo-header.
+pub fn tcp_udp_checksum(src_ip: &[u8], dst_ip: &[u8], proto: u8, data: &[u8]) -> u16 {
+    // Pseudo-header
+    let mut sum = 0u64;
+    sum += u16::from_be_bytes([src_ip[0], src_ip[1]]) as u64;
+    sum += u16::from_be_bytes([src_ip[2], src_ip[3]]) as u64;
+    sum += u16::from_be_bytes([dst_ip[0], dst_ip[1]]) as u64;
+    sum += u16::from_be_bytes([dst_ip[2], dst_ip[3]]) as u64;
+    sum += proto as u64;
+    sum += data.len() as u64;
+    sum += sum_be_words(data);
+    finalize_checksum(sum)
+}
+
+#[inline]
+fn finalize_checksum(mut sum: u64) -> u16 {
+    // Fold carries into 16 bits.
+    while (sum >> 16) != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
     !(sum as u16)
 }
 
-/// Calculate TCP/UDP checksum with pseudo-header.
-pub fn tcp_udp_checksum(src_ip: &[u8], dst_ip: &[u8], proto: u8, data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    
-    // Pseudo-header
-    sum += u16::from_be_bytes([src_ip[0], src_ip[1]]) as u32;
-    sum += u16::from_be_bytes([src_ip[2], src_ip[3]]) as u32;
-    sum += u16::from_be_bytes([dst_ip[0], dst_ip[1]]) as u32;
-    sum += u16::from_be_bytes([dst_ip[2], dst_ip[3]]) as u32;
-    sum += proto as u32;
-    sum += data.len() as u32;
-    
-    // Data
-    let mut i = 0;
-    while i < data.len() {
-        let word = if i + 1 < data.len() {
-            u16::from_be_bytes([data[i], data[i + 1]])
-        } else {
-            u16::from_be_bytes([data[i], 0])
-        };
-        sum += word as u32;
-        i += 2;
+/// Sum 16-bit big-endian words in `data` into a 64-bit accumulator.
+///
+/// Optimized for little-endian hosts (macOS/aarch64): processes 8 bytes at a time.
+#[inline]
+fn sum_be_words(data: &[u8]) -> u64 {
+    #[cfg(target_endian = "little")]
+    {
+        let mut sum = 0u64;
+        let mut i = 0usize;
+
+        // 8-byte chunks
+        while i + 8 <= data.len() {
+            let mut chunk = [0u8; 8];
+            chunk.copy_from_slice(&data[i..i + 8]);
+            let x = u64::from_le_bytes(chunk);
+
+            // Construct big-endian u16 words from byte pairs.
+            let lo = x & 0x00ff00ff00ff00ff;
+            let hi = (x & 0xff00ff00ff00ff00) >> 8;
+            let words = (lo << 8) + hi;
+
+            sum += (words & 0xffff) as u64;
+            sum += ((words >> 16) & 0xffff) as u64;
+            sum += ((words >> 32) & 0xffff) as u64;
+            sum += ((words >> 48) & 0xffff) as u64;
+            i += 8;
+        }
+
+        // Remaining 16-bit words
+        while i + 1 < data.len() {
+            sum += u16::from_be_bytes([data[i], data[i + 1]]) as u64;
+            i += 2;
+        }
+        // Odd trailing byte
+        if i < data.len() {
+            sum += u16::from_be_bytes([data[i], 0]) as u64;
+        }
+        sum
     }
-    
-    while sum >> 16 != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
+    #[cfg(not(target_endian = "little"))]
+    {
+        let mut sum = 0u64;
+        let mut i = 0usize;
+        while i + 1 < data.len() {
+            sum += u16::from_be_bytes([data[i], data[i + 1]]) as u64;
+            i += 2;
+        }
+        if i < data.len() {
+            sum += u16::from_be_bytes([data[i], 0]) as u64;
+        }
+        sum
     }
-    !(sum as u16)
 }
 
 /// Build an IPv4 header.

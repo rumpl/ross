@@ -1,6 +1,6 @@
 //! DHCP server.
 
-use super::eth::{build_eth_header, build_ip_header, ETHERTYPE_IPV4, IP_PROTO_UDP};
+use super::eth::{ETHERTYPE_IPV4, IP_PROTO_UDP, build_eth_header, build_ip_header};
 use super::{GATEWAY_IP, GATEWAY_MAC, GUEST_IP, SUBNET_MASK};
 
 /// Handle DHCP request and return response.
@@ -42,7 +42,10 @@ pub fn handle_dhcp(payload: &[u8]) -> Option<Vec<u8>> {
 
     tracing::info!(
         response = if response_type == 2 { "OFFER" } else { "ACK" },
-        ip = format!("{}.{}.{}.{}", GUEST_IP[0], GUEST_IP[1], GUEST_IP[2], GUEST_IP[3]),
+        ip = format!(
+            "{}.{}.{}.{}",
+            GUEST_IP[0], GUEST_IP[1], GUEST_IP[2], GUEST_IP[3]
+        ),
         "DHCP response"
     );
 

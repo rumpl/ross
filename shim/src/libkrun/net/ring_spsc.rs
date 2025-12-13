@@ -6,15 +6,20 @@
 //!
 //! That makes SPSC safe and very fast (no mutex, no per-packet heap allocation).
 
+use std::ops::Deref;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Max packet size supported by the ring.
+///
+/// IMPORTANT: virtio-net may deliver large packets when offloads (TSO/UFO/GSO) are enabled.
+/// We must be able to carry up to the max Ethernet frame size used by the transport here.
+/// (vfkit/libkrun uses a datagram socket for frames; in practice this can be up to ~64KiB.)
 const MAX_PACKET: usize = 65535;
 
 /// Number of slots (power of two).
 ///
-/// Note: memory usage is roughly `RING_SIZE * MAX_PACKET` bytes per ring. Since we
-/// allocate 2 rings per worker (RX + TX), keep this reasonably small.
+/// With `MAX_PACKET=65535`, ring depth must be kept modest to avoid huge allocations.
+/// Memory per ring is roughly `RING_SIZE * MAX_PACKET`.
 const RING_SIZE: usize = 256;
 
 #[repr(C, align(64))]
@@ -27,6 +32,36 @@ pub struct SpscPacketRing {
     tail: CacheAligned<AtomicU64>,
     lens: Box<[AtomicU32]>,
     data: Box<[u8]>,
+}
+
+/// A borrowed view into the next packet in the ring.
+///
+/// The packet is consumed (tail advanced) when this value is dropped.
+pub struct PacketRef<'a> {
+    ring: &'a SpscPacketRing,
+    tail: u64,
+    off: usize,
+    len: usize,
+}
+
+impl Deref for PacketRef<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        unsafe {
+            let ptr = self.ring.data.as_ptr().add(self.off);
+            std::slice::from_raw_parts(ptr, self.len)
+        }
+    }
+}
+
+impl Drop for PacketRef<'_> {
+    fn drop(&mut self) {
+        // Release the slot.
+        self.ring
+            .tail
+            .0
+            .store(self.tail.wrapping_add(1), Ordering::Release);
+    }
 }
 
 impl SpscPacketRing {
@@ -71,6 +106,29 @@ impl SpscPacketRing {
         true
     }
 
+    /// Peek the next packet as a borrowed slice without copying.
+    ///
+    /// Returns `None` if the ring is empty. The packet is consumed when the returned
+    /// `PacketRef` is dropped.
+    #[inline]
+    pub fn pop_ref(&self) -> Option<PacketRef<'_>> {
+        let tail = self.tail.0.load(Ordering::Relaxed);
+        let head = self.head.0.load(Ordering::Acquire);
+        if tail == head {
+            return None;
+        }
+
+        let idx = (tail as usize) & (RING_SIZE - 1);
+        let len = self.lens[idx].load(Ordering::Relaxed) as usize;
+        let off = idx * MAX_PACKET;
+        Some(PacketRef {
+            ring: self,
+            tail,
+            off,
+            len,
+        })
+    }
+
     /// Try to pop a packet into `out`; returns the packet length.
     #[inline]
     pub fn pop(&self, out: &mut [u8]) -> Option<usize> {
@@ -100,5 +158,3 @@ impl SpscPacketRing {
 
 unsafe impl Send for SpscPacketRing {}
 unsafe impl Sync for SpscPacketRing {}
-
-
