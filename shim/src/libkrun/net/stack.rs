@@ -32,6 +32,18 @@ impl VmNetwork {
         let server_fd = socket(AddressFamily::Unix, SockType::Datagram, SockFlag::empty(), None)
             .map_err(|e| ShimError::RuntimeError(format!("socket: {}", e)))?;
 
+        // Increase receive buffer size to prevent drops during high throughput
+        unsafe {
+            let buf_size: libc::c_int = 4 * 1024 * 1024; // 4MB
+            libc::setsockopt(
+                server_fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+
         let addr = UnixAddr::new(&socket_path)
             .map_err(|e| ShimError::RuntimeError(format!("addr: {}", e)))?;
 
@@ -119,46 +131,68 @@ fn run_stack(fd: i32, shutdown: Arc<AtomicBool>) {
         thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    // Main loop
+    // Main loop - prioritize draining VM packets to prevent TX queue stalls
     let mut nat_state = NatState::new();
-    
+    let mut pending_responses: Vec<Vec<u8>> = Vec::new();
+    let mut idle_count = 0u32;
+
     loop {
-        if shutdown.load(Ordering::SeqCst) {
+        if shutdown.load(Ordering::Relaxed) {
             break;
         }
 
-        // Receive packet
-        let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
+        let mut received_any = false;
 
-        if n > 0 {
-            let n = n as usize;
-            if let Some(resp) = process_frame(&buf[..n], &mut nat_state) {
-                send_packet(fd, &resp);
-            }
-        } else if n < 0 {
-            let err = std::io::Error::last_os_error();
-            match err.kind() {
-                std::io::ErrorKind::WouldBlock => {}
-                std::io::ErrorKind::ConnectionReset => {
+        // Phase 1: Drain ALL pending packets from VM as fast as possible
+        // This is critical to prevent virtio TX queue stalls
+        loop {
+            let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
+
+            if n > 0 {
+                received_any = true;
+                let n = n as usize;
+                if let Some(resp) = process_frame(&buf[..n], &mut nat_state) {
+                    pending_responses.push(resp);
+                }
+            } else if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::WouldBlock {
+                    break; // No more packets
+                } else if err.kind() == std::io::ErrorKind::ConnectionReset {
                     tracing::debug!("VM disconnected");
-                    break;
-                }
-                _ => {
+                    return;
+                } else {
                     tracing::error!(error = %err, "recv error");
-                    break;
+                    return;
                 }
+            } else {
+                tracing::debug!("VM connection closed");
+                return;
             }
-        } else if n == 0 {
-            tracing::debug!("VM connection closed");
-            break;
         }
 
-        // Poll NAT sockets
-        for resp in poll_nat_sockets(&mut nat_state) {
+        // Phase 2: Send pending responses to VM
+        for resp in pending_responses.drain(..) {
             send_packet(fd, &resp);
         }
 
-        thread::sleep(std::time::Duration::from_micros(100));
+        // Phase 3: Poll NAT sockets for data from remote servers
+        let responses = poll_nat_sockets(&mut nat_state);
+        let sent_any = !responses.is_empty();
+        for resp in responses {
+            send_packet(fd, &resp);
+        }
+
+        // Only yield/sleep if we're truly idle
+        if received_any || sent_any {
+            idle_count = 0;
+        } else {
+            idle_count = idle_count.saturating_add(1);
+            if idle_count > 10000 {
+                // Been idle for a while, sleep briefly
+                thread::sleep(std::time::Duration::from_micros(100));
+            }
+        }
     }
 
     tracing::debug!("Network stack stopped");

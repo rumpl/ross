@@ -41,6 +41,8 @@ struct TcpNatEntry {
     /// Next expected sequence number from guest
     expected_guest_seq: u32,
     last_active: Instant,
+    /// Pending data to write to the remote server
+    write_buffer: Vec<u8>,
 }
 
 impl TcpNatEntry {
@@ -252,19 +254,42 @@ pub fn handle_tcp(
         );
     }
 
-    // Process data from guest
+    // Process data from guest - use non-blocking write
     if !data.is_empty() {
-        if let Err(e) = entry.stream.write_all(data) {
-            tracing::debug!(error = %e, "TCP write failed");
-            let resp = build_tcp_packet(
-                &entry.client_mac, &entry.client_ip, entry.client_port,
-                entry.remote_port, &entry.remote_ip,
-                0, 0, 0x04, &[],
-            );
-            state.tcp.remove(&key);
-            return resp;
-        }
+        entry.write_buffer.extend_from_slice(data);
         entry.expected_guest_seq = entry.expected_guest_seq.wrapping_add(data.len() as u32);
+    }
+
+    // Try to flush write buffer
+    if !entry.write_buffer.is_empty() {
+        match entry.stream.write(&entry.write_buffer) {
+            Ok(0) => {
+                // Connection closed
+                let resp = build_tcp_packet(
+                    &entry.client_mac, &entry.client_ip, entry.client_port,
+                    entry.remote_port, &entry.remote_ip,
+                    0, 0, 0x04, &[],
+                );
+                state.tcp.remove(&key);
+                return resp;
+            }
+            Ok(n) => {
+                entry.write_buffer.drain(..n);
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // Can't write now, will retry later
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "TCP write failed");
+                let resp = build_tcp_packet(
+                    &entry.client_mac, &entry.client_ip, entry.client_port,
+                    entry.remote_port, &entry.remote_ip,
+                    0, 0, 0x04, &[],
+                );
+                state.tcp.remove(&key);
+                return resp;
+            }
+        }
     }
 
     // FIN
@@ -355,6 +380,17 @@ fn handle_tcp_syn(
         Ok(stream) => {
             stream.set_nonblocking(true).ok();
             stream.set_nodelay(true).ok();
+            // Increase send buffer for better throughput
+            unsafe {
+                let buf_size: libc::c_int = 256 * 1024; // 256KB
+                libc::setsockopt(
+                    std::os::unix::io::AsRawFd::as_raw_fd(&stream),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    &buf_size as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
 
             let our_seq = 1000u32;
             let expected_guest_seq = seq.wrapping_add(1);
@@ -371,6 +407,7 @@ fn handle_tcp_syn(
                 acked_seq: our_seq, // Guest hasn't ACKed anything yet
                 expected_guest_seq,
                 last_active: Instant::now(),
+                write_buffer: Vec::new(),
             });
 
             build_tcp_packet(src_mac, src_ip, src_port, dst_port, &original_ip, our_seq, expected_guest_seq, 0x12, &[])
@@ -434,17 +471,62 @@ pub fn poll_nat_sockets(state: &mut NatState) -> Vec<Vec<u8>> {
         }
     }
 
-    // Poll TCP - only send one packet per connection per poll to avoid flooding
+    // Poll TCP - send multiple packets per connection for better throughput
+    const MAX_PACKETS_PER_CONN: usize = 16;
     let tcp_keys: Vec<_> = state.tcp.keys().cloned().collect();
+    
     for key in tcp_keys {
+        // First, try to flush any pending write buffer
         if let Some(entry) = state.tcp.get_mut(&key) {
+            if !entry.write_buffer.is_empty() {
+                match entry.stream.write(&entry.write_buffer) {
+                    Ok(0) => {
+                        // Connection closed
+                        if let Some(resp) = build_tcp_packet(
+                            &entry.client_mac, &entry.client_ip, entry.client_port,
+                            entry.remote_port, &entry.remote_ip,
+                            0, 0, 0x04, &[],
+                        ) {
+                            responses.push(resp);
+                        }
+                        state.tcp.remove(&key);
+                        continue;
+                    }
+                    Ok(n) => {
+                        entry.write_buffer.drain(..n);
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => {
+                        if let Some(resp) = build_tcp_packet(
+                            &entry.client_mac, &entry.client_ip, entry.client_port,
+                            entry.remote_port, &entry.remote_ip,
+                            0, 0, 0x04, &[],
+                        ) {
+                            responses.push(resp);
+                        }
+                        state.tcp.remove(&key);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Then read data from server to send to guest
+        let mut packets_sent = 0;
+        
+        while packets_sent < MAX_PACKETS_PER_CONN {
+            let Some(entry) = state.tcp.get_mut(&key) else {
+                break;
+            };
+            
             if !entry.can_send() {
-                continue;
+                break;
             }
 
             let mut buf = [0u8; MAX_SEGMENT_SIZE];
             match entry.stream.read(&mut buf) {
                 Ok(0) => {
+                    // Connection closed
                     if let Some(resp) = build_tcp_packet(
                         &entry.client_mac, &entry.client_ip, entry.client_port,
                         entry.remote_port, &entry.remote_ip,
@@ -453,6 +535,7 @@ pub fn poll_nat_sockets(state: &mut NatState) -> Vec<Vec<u8>> {
                         responses.push(resp);
                     }
                     state.tcp.remove(&key);
+                    break;
                 }
                 Ok(len) => {
                     if let Some(resp) = build_tcp_packet(
@@ -465,13 +548,30 @@ pub fn poll_nat_sockets(state: &mut NatState) -> Vec<Vec<u8>> {
                     if let Some(e) = state.tcp.get_mut(&key) {
                         e.our_seq = e.our_seq.wrapping_add(len as u32);
                     }
+                    packets_sent += 1;
                 }
-                Err(_) => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    break;
+                }
+                Err(_) => {
+                    // Error - send RST
+                    if let Some(entry) = state.tcp.get(&key)
+                        && let Some(resp) = build_tcp_packet(
+                            &entry.client_mac, &entry.client_ip, entry.client_port,
+                            entry.remote_port, &entry.remote_ip,
+                            0, 0, 0x04, &[],
+                        )
+                    {
+                        responses.push(resp);
+                    }
+                    state.tcp.remove(&key);
+                    break;
+                }
             }
         }
     }
 
-    // Cleanup
+    // Cleanup stale connections
     let now = Instant::now();
     state.udp.retain(|_, e| now.duration_since(e.last_active) < Duration::from_secs(60));
     state.tcp.retain(|_, e| now.duration_since(e.last_active) < Duration::from_secs(300));
