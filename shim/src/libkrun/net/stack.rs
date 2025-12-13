@@ -40,10 +40,12 @@ impl VmNetwork {
         )
         .map_err(|e| ShimError::RuntimeError(format!("socket: {}", e)))?;
 
-        // Increase receive buffer size to prevent drops during high throughput.
-        // With virtio/vfkit, a too-small rcvbuf can cause the guest TX queue to stall.
+        // Increase socket buffer sizes to maximum for high-throughput networking.
+        // These buffers are critical for preventing packet drops during bursts.
+        // macOS allows up to 8MB per socket by default, but we request larger
+        // and let the kernel cap to the maximum allowed.
         unsafe {
-            let buf_size: libc::c_int = 64 * 1024 * 1024; // 64MB
+            let buf_size: libc::c_int = 128 * 1024 * 1024; // Request 128MB (will be capped by kernel)
             libc::setsockopt(
                 server_fd.as_raw_fd(),
                 libc::SOL_SOCKET,
@@ -51,11 +53,6 @@ impl VmNetwork {
                 &buf_size as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
             );
-        }
-
-        // Also increase send buffer size to reduce backpressure during bursts.
-        unsafe {
-            let buf_size: libc::c_int = 64 * 1024 * 1024; // 64MB
             libc::setsockopt(
                 server_fd.as_raw_fd(),
                 libc::SOL_SOCKET,
@@ -186,11 +183,11 @@ fn run_stack_single(fd: i32, shutdown: Arc<AtomicBool>) {
     // Main loop - prioritize draining VM packets to prevent TX queue stalls
     let mut nat_state = NatState::new();
     let mut dns_forwarder: Option<DnsForwarder> = None;
-    let mut pending_responses: Vec<Vec<u8>> = Vec::with_capacity(256);
-    let mut nat_responses: Vec<Vec<u8>> = Vec::with_capacity(256);
+    let mut pending_responses: Vec<Vec<u8>> = Vec::with_capacity(512);
+    let mut nat_responses: Vec<Vec<u8>> = Vec::with_capacity(512);
     let mut buf = [0u8; 65535];
     // Outbox of packets waiting for VM socket to become writable.
-    let mut outbox: VecDeque<Vec<u8>> = VecDeque::with_capacity(1024);
+    let mut outbox: VecDeque<Vec<u8>> = VecDeque::with_capacity(2048);
     let mut idle_count = 0u32;
 
     loop {
@@ -204,15 +201,27 @@ fn run_stack_single(fd: i32, shutdown: Arc<AtomicBool>) {
         let mut received_any = false;
 
         // Phase 1: Drain ALL pending packets from VM as fast as possible
-        // This is critical to prevent virtio TX queue stalls
+        // This is critical to prevent virtio TX queue stalls.
+        // Process in batches of up to 64 packets before checking outbox,
+        // to balance RX throughput with TX responsiveness.
+        let mut rx_batch = 0;
         loop {
             let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut _, buf.len(), 0) };
 
             if n > 0 {
                 received_any = true;
+                rx_batch += 1;
                 let n = n as usize;
                 if let Some(resp) = process_frame(&buf[..n], &mut nat_state, &mut dns_forwarder) {
                     pending_responses.push(resp);
+                }
+                // Periodically flush to keep TX moving
+                if rx_batch >= 64 && !pending_responses.is_empty() {
+                    for resp in pending_responses.drain(..) {
+                        queue_or_send_nowait(fd, &mut outbox, resp);
+                    }
+                    flush_outbox_nowait(fd, &mut outbox);
+                    rx_batch = 0;
                 }
             } else if n < 0 {
                 let err = std::io::Error::last_os_error();
@@ -243,15 +252,20 @@ fn run_stack_single(fd: i32, shutdown: Arc<AtomicBool>) {
             queue_or_send_nowait(fd, &mut outbox, resp);
         }
 
-        // Only yield/sleep if we're truly idle
+        // Adaptive idle: spin briefly, then yield, then sleep
+        // This reduces latency for bursty traffic while saving CPU during idle periods
         if received_any || sent_any {
             idle_count = 0;
         } else {
             idle_count = idle_count.saturating_add(1);
-            if idle_count > 10000 {
+            if idle_count > 50000 {
                 // Been idle for a while, sleep briefly
                 thread::sleep(std::time::Duration::from_micros(100));
+            } else if idle_count > 1000 {
+                // Moderately idle - yield to other threads
+                thread::yield_now();
             }
+            // Below 1000 iterations: pure spin for lowest latency
         }
     }
 
@@ -433,6 +447,8 @@ fn net_worker_loop_lockfree(
 
 fn tx_sender_loop_lockfree(fd: i32, tx_rings: Vec<Arc<SpscPacketRing>>, shutdown: Arc<AtomicBool>) {
     // Send directly from ring storage (no memcpy) and only poll when we hit EAGAIN.
+    let mut idle_count = 0u32;
+    
     loop {
         if shutdown.load(Ordering::Relaxed) {
             break;
@@ -440,8 +456,10 @@ fn tx_sender_loop_lockfree(fd: i32, tx_rings: Vec<Arc<SpscPacketRing>>, shutdown
 
         let mut did_work = false;
 
+        // Round-robin through rings to avoid starvation
         for ring in tx_rings.iter() {
-            loop {
+            // Drain up to 64 packets per ring per iteration for better batching
+            for _ in 0..64 {
                 let Some(pkt) = ring.pop_ref() else { break };
                 did_work = true;
                 if !send_packet_ref(fd, pkt) {
@@ -451,8 +469,16 @@ fn tx_sender_loop_lockfree(fd: i32, tx_rings: Vec<Arc<SpscPacketRing>>, shutdown
             }
         }
 
-        if !did_work {
-            thread::yield_now();
+        if did_work {
+            idle_count = 0;
+        } else {
+            idle_count = idle_count.saturating_add(1);
+            if idle_count > 10000 {
+                thread::sleep(Duration::from_micros(50));
+            } else if idle_count > 100 {
+                thread::yield_now();
+            }
+            // Pure spin for < 100 iterations
         }
     }
 }
@@ -524,7 +550,8 @@ fn send_packet_nowait(fd: i32, data: &[u8]) -> SendResult {
 }
 
 fn queue_or_send_nowait(fd: i32, outbox: &mut VecDeque<Vec<u8>>, pkt: Vec<u8>) {
-    const OUTBOX_MAX: usize = 4096;
+    // Large outbox to handle burst traffic - 16K packets at 1500 bytes = 24MB max
+    const OUTBOX_MAX: usize = 16384;
     if outbox.is_empty() {
         match send_packet_nowait(fd, &pkt) {
             SendResult::Sent => return,
@@ -536,23 +563,75 @@ fn queue_or_send_nowait(fd: i32, outbox: &mut VecDeque<Vec<u8>>, pkt: Vec<u8>) {
             }
             SendResult::Failed => return,
         }
-    } else {
-        if outbox.len() < OUTBOX_MAX {
-            outbox.push_back(pkt);
+    } else if outbox.len() < OUTBOX_MAX {
+        outbox.push_back(pkt);
+    }
+    // Drop packet if outbox is full (better than stalling)
+}
+
+fn flush_outbox_nowait(fd: i32, outbox: &mut VecDeque<Vec<u8>>) {
+    // Use sendmmsg to batch multiple packets in a single syscall when available
+    #[cfg(target_os = "linux")]
+    {
+        flush_outbox_sendmmsg(fd, outbox);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // macOS doesn't have sendmmsg, fall back to individual sends
+        while let Some(pkt) = outbox.front() {
+            match send_packet_nowait(fd, pkt) {
+                SendResult::Sent => {
+                    let _ = outbox.pop_front();
+                }
+                SendResult::WouldBlock => break,
+                SendResult::Failed => {
+                    let _ = outbox.pop_front();
+                }
+            }
         }
     }
 }
 
-fn flush_outbox_nowait(fd: i32, outbox: &mut VecDeque<Vec<u8>>) {
-    while let Some(pkt) = outbox.front() {
-        match send_packet_nowait(fd, pkt) {
-            SendResult::Sent => {
-                let _ = outbox.pop_front();
+#[cfg(target_os = "linux")]
+fn flush_outbox_sendmmsg(fd: i32, outbox: &mut VecDeque<Vec<u8>>) {
+    const MAX_BATCH: usize = 64;
+    
+    while !outbox.is_empty() {
+        let batch_size = outbox.len().min(MAX_BATCH);
+        if batch_size == 0 {
+            break;
+        }
+        
+        // Build iovec and mmsghdr arrays
+        let mut iovecs: [libc::iovec; MAX_BATCH] = unsafe { std::mem::zeroed() };
+        let mut msghdrs: [libc::mmsghdr; MAX_BATCH] = unsafe { std::mem::zeroed() };
+        
+        for (i, pkt) in outbox.iter().take(batch_size).enumerate() {
+            iovecs[i] = libc::iovec {
+                iov_base: pkt.as_ptr() as *mut _,
+                iov_len: pkt.len(),
+            };
+            msghdrs[i].msg_hdr.msg_iov = &mut iovecs[i];
+            msghdrs[i].msg_hdr.msg_iovlen = 1;
+        }
+        
+        let sent = unsafe {
+            libc::sendmmsg(fd, msghdrs.as_mut_ptr(), batch_size as u32, 0)
+        };
+        
+        if sent <= 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                break;
             }
-            SendResult::WouldBlock => break,
-            SendResult::Failed => {
-                let _ = outbox.pop_front();
-            }
+            // On error, try to at least drain one packet to avoid infinite loop
+            let _ = outbox.pop_front();
+            break;
+        }
+        
+        // Remove sent packets
+        for _ in 0..sent {
+            let _ = outbox.pop_front();
         }
     }
 }

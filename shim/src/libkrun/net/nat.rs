@@ -13,11 +13,18 @@ use std::time::{Duration, Instant};
 // Max TCP payload we place in a single Ethernet+IPv4+TCP frame.
 // Keep IP total length <= 1500 (typical MTU): 1500 - 20 (IP) - 20 (TCP) = 1460.
 const MAX_SEGMENT_SIZE: usize = 1460;
+// Large read buffer for batching: read up to 64KB from host sockets at once,
+// then split into MSS-sized segments. This dramatically reduces syscall overhead.
+const TCP_READ_BUFFER_SIZE: usize = 64 * 1024;
 // Upper bound for in-flight bytes to guest (we also gate on the guest's advertised window).
-// Keeping this higher than 64KiB helps when the guest uses window scaling.
-const TCP_INFLIGHT_CAP: u32 = 1024 * 1024; // 1MiB
+// Keep this high to allow the TCP pipeline to stay full during high-throughput transfers.
+const TCP_INFLIGHT_CAP: u32 = 4 * 1024 * 1024; // 4MiB - allows ~2.7ms of data at 10Gbps
 const UDP_MAX_DATAGRAM: usize = 65535;
-const OUR_WSCALE: u8 = 4; // advertise 16x window scale to guest (~1MiB effective at 65535)
+const OUR_WSCALE: u8 = 7; // advertise 128x window scale to guest (~8MiB effective at 65535)
+
+// Socket buffer sizes for TCP connections
+const TCP_SOCKET_SNDBUF: i32 = 4 * 1024 * 1024; // 4MB send buffer
+const TCP_SOCKET_RCVBUF: i32 = 4 * 1024 * 1024; // 4MB receive buffer
 
 /// Translate destination IP if it's the special host IP.
 /// Returns (actual_ip, original_ip) where actual_ip is what we connect to
@@ -85,7 +92,8 @@ pub struct NatState {
     udp: HashMap<([u8; 4], u16, u16), UdpNatEntry>,
     // Reusable scratch buffers to avoid per-poll/per-packet stack allocations.
     udp_rx_buf: Vec<u8>,
-    tcp_rx_buf: [u8; MAX_SEGMENT_SIZE],
+    // Large read buffer to batch reads from host sockets
+    tcp_rx_buf: Vec<u8>,
     tcp_keys_scratch: Vec<([u8; 4], u16, u16)>,
 }
 
@@ -95,7 +103,7 @@ impl NatState {
             tcp: HashMap::new(),
             udp: HashMap::new(),
             udp_rx_buf: vec![0u8; UDP_MAX_DATAGRAM],
-            tcp_rx_buf: [0u8; MAX_SEGMENT_SIZE],
+            tcp_rx_buf: vec![0u8; TCP_READ_BUFFER_SIZE],
             tcp_keys_scratch: Vec::with_capacity(64),
         }
     }
@@ -477,8 +485,12 @@ pub fn handle_tcp(
     }
 
     // Try to send data to guest if we have window space
+    // Read up to MAX_SEGMENT_SIZE here since we can only return one packet.
+    // The bulk of data transfer happens in poll_nat_sockets with batch reads.
     if entry.can_send() {
-        match entry.stream.read(&mut state.tcp_rx_buf) {
+        // Use a stack buffer for quick inline reads (avoid indexing the large heap buffer)
+        let mut quick_buf = [0u8; MAX_SEGMENT_SIZE];
+        match entry.stream.read(&mut quick_buf) {
             Ok(0) => {
                 let resp = build_tcp_packet(
                     &entry.client_mac,
@@ -504,7 +516,7 @@ pub fn handle_tcp(
                     entry.our_seq,
                     entry.expected_guest_seq,
                     0x18,
-                    &state.tcp_rx_buf[..len],
+                    &quick_buf[..len],
                 );
                 entry.our_seq = entry.our_seq.wrapping_add(len as u32);
                 return resp;
@@ -588,14 +600,24 @@ fn handle_tcp_syn(
         Ok(stream) => {
             stream.set_nonblocking(true).ok();
             stream.set_nodelay(true).ok();
-            // Increase send buffer for better throughput
+            // Increase socket buffers for better throughput
             unsafe {
-                let buf_size: libc::c_int = 256 * 1024; // 256KB
+                use std::os::unix::io::AsRawFd;
+                let fd = stream.as_raw_fd();
+                // Large send buffer to avoid backpressure stalls
                 libc::setsockopt(
-                    std::os::unix::io::AsRawFd::as_raw_fd(&stream),
+                    fd,
                     libc::SOL_SOCKET,
                     libc::SO_SNDBUF,
-                    &buf_size as *const _ as *const libc::c_void,
+                    &TCP_SOCKET_SNDBUF as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+                // Large receive buffer to absorb bursts from remote server
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    &TCP_SOCKET_RCVBUF as *const _ as *const libc::c_void,
                     std::mem::size_of::<libc::c_int>() as libc::socklen_t,
                 );
             }
@@ -813,8 +835,7 @@ pub fn poll_nat_sockets(state: &mut NatState, responses: &mut Vec<Vec<u8>>) {
         }
     }
 
-    // Poll TCP - send multiple packets per connection for better throughput
-    const MAX_PACKETS_PER_CONN: usize = 16;
+    // Poll TCP - batch reads for better throughput
     state.tcp_keys_scratch.clear();
     state.tcp_keys_scratch.extend(state.tcp.keys().cloned());
 
@@ -877,10 +898,10 @@ pub fn poll_nat_sockets(state: &mut NatState, responses: &mut Vec<Vec<u8>>) {
             }
         }
 
-        // Then read data from server to send to guest
-        let mut packets_sent = 0;
-
-        while packets_sent < MAX_PACKETS_PER_CONN {
+        // Read data from server to send to guest - batch reads for efficiency
+        // Read up to TCP_READ_BUFFER_SIZE bytes at once, then split into MSS-sized segments.
+        // This dramatically reduces syscall overhead compared to reading MSS bytes at a time.
+        'read_loop: loop {
             let Some(entry) = state.tcp.get_mut(&key) else {
                 break;
             };
@@ -906,29 +927,44 @@ pub fn poll_nat_sockets(state: &mut NatState, responses: &mut Vec<Vec<u8>>) {
                         responses.push(resp);
                     }
                     state.tcp.remove(&key);
-                    break;
+                    break 'read_loop;
                 }
-                Ok(len) => {
-                    if let Some(resp) = build_tcp_packet(
-                        &entry.client_mac,
-                        &entry.client_ip,
-                        entry.client_port,
-                        entry.remote_port,
-                        &entry.remote_ip,
-                        entry.our_seq,
-                        entry.expected_guest_seq,
-                        0x18,
-                        &state.tcp_rx_buf[..len],
-                    ) {
-                        responses.push(resp);
+                Ok(total_len) => {
+                    // Split into MSS-sized segments for the guest
+                    let mut offset = 0;
+                    while offset < total_len {
+                        let chunk_len = (total_len - offset).min(MAX_SEGMENT_SIZE);
+                        let chunk = &state.tcp_rx_buf[offset..offset + chunk_len];
+
+                        if let Some(e) = state.tcp.get(&key) {
+                            let seq = e.our_seq.wrapping_add(offset as u32);
+                            if let Some(resp) = build_tcp_packet(
+                                &e.client_mac,
+                                &e.client_ip,
+                                e.client_port,
+                                e.remote_port,
+                                &e.remote_ip,
+                                seq,
+                                e.expected_guest_seq,
+                                0x18,
+                                chunk,
+                            ) {
+                                responses.push(resp);
+                            }
+                        }
+                        offset += chunk_len;
                     }
                     if let Some(e) = state.tcp.get_mut(&key) {
-                        e.our_seq = e.our_seq.wrapping_add(len as u32);
+                        e.our_seq = e.our_seq.wrapping_add(total_len as u32);
                     }
-                    packets_sent += 1;
+                    // If we read less than buffer size, socket is likely drained
+                    if total_len < TCP_READ_BUFFER_SIZE / 2 {
+                        break 'read_loop;
+                    }
+                    // Continue reading if there might be more data
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    break;
+                    break 'read_loop;
                 }
                 Err(_) => {
                     // Error - send RST
@@ -948,7 +984,7 @@ pub fn poll_nat_sockets(state: &mut NatState, responses: &mut Vec<Vec<u8>>) {
                         responses.push(resp);
                     }
                     state.tcp.remove(&key);
-                    break;
+                    break 'read_loop;
                 }
             }
         }

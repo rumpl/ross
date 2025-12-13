@@ -18,9 +18,10 @@ const MAX_PACKET: usize = 65535;
 
 /// Number of slots (power of two).
 ///
-/// With `MAX_PACKET=65535`, ring depth must be kept modest to avoid huge allocations.
-/// Memory per ring is roughly `RING_SIZE * MAX_PACKET`.
-const RING_SIZE: usize = 256;
+/// With `MAX_PACKET=65535`, each ring is ~32MB. Higher depth allows better batching
+/// and reduces the chance of drops during bursts. 512 slots provides good balance
+/// between memory usage and throughput.
+const RING_SIZE: usize = 512;
 
 #[repr(C, align(64))]
 struct CacheAligned<T>(T);
